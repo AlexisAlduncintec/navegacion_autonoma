@@ -102,6 +102,32 @@ MAX_ANGLE_CHANGE_PER_FRAME = 0.05
 DEFAULT_STEERING_ANGLE = 0.0
 NO_DETECTION_GRACE_FRAMES = 20
 
+# --- Setpoint del PID en el eje X de la imagen (FIX setpoint - Actividad 3.1) ---
+# La cámara es 256 px de ancho; el controlador heredado de Actividad 2.1 usaba
+# image_width / 2 = 128 como setpoint, asumiendo que la línea amarilla debía
+# caer en el centro del frame. Eso equivale a "el coche se monta sobre la
+# línea central de la carretera", no a "el coche va en su carril derecho".
+#
+# En este mundo (city_2025a_activity_3_1.wbt) la línea central amarilla
+# separa los dos sentidos de circulación. Cuando el BMW va correctamente en
+# su carril derecho, la línea se ve a la IZQUIERDA del centro de cámara
+# (porque la cámara está montada sobre el centro del cofre del coche, y el
+# coche está a la derecha del centro de la calle).
+#
+# Diagnóstico del bug: con setpoint=128 el PID arrastraba al coche hacia
+# la izquierda hasta que la línea quedaba bajo el centro de la imagen,
+# lo cual significa que el coche estaba pisando la línea central /
+# invadiendo el carril contrario / saliéndose a la banqueta izquierda.
+#
+# Setpoint corregido: estimado a partir de la geometría del carril y la FOV
+# de la cámara (FOV ≈ 1 rad, ancho carril ≈ 3.5 m, mitad = 1.75 m a la izq
+# de la cámara; a ~10 m de distancia eso corresponde a aprox 87-110 px de
+# desplazamiento desde el centro). Punto de partida: 110. Si el coche sigue
+# derivando a la izquierda hay que bajar más (probar 100, 95...); si ahora
+# deriva a la derecha hay que subir (probar 115, 120...). Iterar con ojos
+# en el viewport, NO ajustar Kp/Kd/SVM/LiDAR.
+PID_SETPOINT_PX = 110
+
 # --- Robustez en intersecciones (FIX 1 - Actividad 3.1) ---
 # El controlador heredado de Actividad 2.1 al perder la línea más de
 # NO_DETECTION_GRACE_FRAMES poníaa el ángulo a 0 y reseteaba el PID. En
@@ -276,10 +302,16 @@ def detect_lines(edges_roi):
 
 
 def compute_error(lines, image_width):
-    """Devuelve (error, num_valid_lines). Filtra líneas casi horizontales."""
+    """Devuelve (error, num_valid_lines). Filtra líneas casi horizontales.
+
+    El setpoint del PID NO es el centro de la imagen — es PID_SETPOINT_PX,
+    una constante calibrada para que cuando el coche va correctamente en
+    su carril derecho, la línea amarilla central de la calzada caiga en
+    ese pixel (a la izquierda del centro). Ver comentario del constante.
+    """
     if lines is None:
         return None, 0
-    setpoint = image_width / 2.0
+    setpoint = PID_SETPOINT_PX
     smallest_error = None
     valid_lines = 0
     for line in lines:
@@ -310,8 +342,11 @@ def draw_lines_on_image(image_bgr, lines, color=(0, 255, 0), thickness=2):
 
 
 def draw_setpoint_line(image_bgr, color=(0, 0, 255)):
+    """Dibuja una línea vertical en PID_SETPOINT_PX (NO en el centro de la
+    imagen). El operador puede ver dónde el PID está intentando colocar la
+    línea amarilla del carril."""
     output = image_bgr.copy()
-    x = output.shape[1] // 2
+    x = int(PID_SETPOINT_PX)
     cv2.line(output, (x, 0), (x, output.shape[0]), color, 1)
     return output
 
@@ -485,7 +520,8 @@ def main():
     camera.enable(timestep)
     img_width = camera.getWidth()
     img_height = camera.getHeight()
-    print(f"[INIT] Cámara: {img_width}x{img_height}, setpoint={img_width/2}")
+    print(f"[INIT] Cámara: {img_width}x{img_height}, setpoint={PID_SETPOINT_PX}px "
+          f"(offset {PID_SETPOINT_PX - img_width/2:+.0f} px desde el centro)")
 
     # Display para visualización en el simulador
     display_img = Display("display_image")
