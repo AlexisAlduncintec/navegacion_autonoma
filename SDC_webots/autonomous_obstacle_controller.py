@@ -102,6 +102,19 @@ MAX_ANGLE_CHANGE_PER_FRAME = 0.05
 DEFAULT_STEERING_ANGLE = 0.0
 NO_DETECTION_GRACE_FRAMES = 20
 
+# --- Robustez en intersecciones (FIX 1 - Actividad 3.1) ---
+# El controlador heredado de Actividad 2.1 al perder la línea más de
+# NO_DETECTION_GRACE_FRAMES poníaa el ángulo a 0 y reseteaba el PID. En
+# intersecciones (donde no hay línea amarilla) eso causaba que el coche
+# atravesara recto, se saliera del trazado, y terminara en la calle
+# perpendicular sin posibilidad de recuperar la línea.
+#
+# Fix mínimo: durante la pérdida prolongada se mantiene el ÚLTIMO ÁNGULO
+# VÁLIDO (no se resetea a 0) y se baja la velocidad de crucero. Velocidad
+# más baja => menos distancia recorrida ciegamente => más probabilidad de
+# re-encontrar la línea amarilla antes de salir del camino pintado.
+LANE_LOST_SPEED_KMH = 20.0   # velocidad reducida durante intersecciones (vs 50 normal)
+
 
 # =============================================================================
 # CONSTANTES LiDAR (NUEVO - Stage 2)
@@ -517,6 +530,11 @@ def main():
     # Último resultado del SVM (para reutilizar entre frames cuando el SVM
     # se saltea por SVM_RUN_EVERY_N).
     last_svm_is_pedestrian = False
+    # Última velocidad de crucero aplicada. Usado para el debounce extendido
+    # (FIX 1): la velocidad ahora depende del estado del state-machine AND
+    # del estado de la línea (lane_lost_extended), no sólo del estado, así
+    # que el debounce no puede engancharse sólo a cambios de estado.
+    last_cruising_speed = None
 
     # --- Loop principal ---
     # IMPORTANTE: usamos driver.step() (no robot.step()). El controlador hereda
@@ -547,14 +565,22 @@ def main():
         # 4. PID -> ángulo de dirección. robot.getTime() es tiempo de
         # simulación; correcto incluso si Webots corre en fast-mode.
         current_time = robot.getTime()
+        # lane_lost_extended se usa más abajo en el state-machine para reducir
+        # la velocidad de crucero cuando la línea lleva mucho rato sin verse
+        # (típicamente porque estamos cruzando una intersección).
+        lane_lost_extended = False
         if error is None:
             frames_since_detection += 1
             no_line_count += 1
-            if frames_since_detection <= NO_DETECTION_GRACE_FRAMES:
-                steering_angle = last_valid_angle
-            else:
-                steering_angle = DEFAULT_STEERING_ANGLE
-                pid.reset()
+            # FIX 1: Mantener SIEMPRE el último ángulo válido cuando se pierde
+            # la línea — el comportamiento previo (resetear a 0 + reset del PID
+            # tras el grace period) hacía que el coche atravesara intersecciones
+            # en línea recta y terminara fuera del trazado. Si la línea estaba
+            # recta justo antes, last_valid_angle ya es ≈ 0; si estaba curva,
+            # el coche mantiene la curva, lo cual es lo correcto.
+            steering_angle = last_valid_angle
+            if frames_since_detection > NO_DETECTION_GRACE_FRAMES:
+                lane_lost_extended = True
         else:
             steering_angle = pid.compute(error, current_time)
             last_valid_angle = steering_angle
@@ -604,22 +630,31 @@ def main():
         # avería simulada (lo pide la actividad). El supervisor despawnea el
         # barril tras ~10 ticks -> el LiDAR queda libre -> regresamos a DRIVING.
         #
-        # DEBOUNCE: las llamadas setCruisingSpeed / setHazardFlashers se hacen
-        # SOLO en transiciones de estado, no cada frame. Cada una de esas APIs
-        # hace una llamada IPC a Webots; mantenerlas dentro del 'if cambia'
-        # reduce ~2 IPC/frame redundantes durante los tramos largos de
-        # crucero o frenado. setSteeringAngle sí se llama cada frame porque
-        # su valor cambia con la salida del PID.
+        # FIX 1 (intersecciones): además del estado, la velocidad efectiva en
+        # DRIVING depende de si llevamos rato sin ver la línea. Si la línea
+        # está perdida más de NO_DETECTION_GRACE_FRAMES, bajamos a
+        # LANE_LOST_SPEED_KMH para tener más oportunidad de re-detectar antes
+        # de salir del trazado pintado.
+        if new_state == STATE_DRIVING:
+            target_cruising_speed = (LANE_LOST_SPEED_KMH if lane_lost_extended
+                                     else TARGET_SPEED)
+            target_hazard = False
+        elif new_state == STATE_BRAKE_PEDESTRIAN:
+            target_cruising_speed = BRAKE_SPEED_KMH
+            target_hazard = False
+        else:  # STATE_BRAKE_BARREL
+            target_cruising_speed = BRAKE_SPEED_KMH
+            target_hazard = True
+
+        # Debounce: solo enviamos por IPC cuando el valor objetivo cambia.
+        # Esto cubre el cambio por estado Y el cambio por línea-perdida.
+        if target_cruising_speed != last_cruising_speed:
+            driver.setCruisingSpeed(target_cruising_speed)
+            last_cruising_speed = target_cruising_speed
+        # setHazardFlashers solo cambia con el estado (no con la línea),
+        # entonces sigue siendo seguro engancharlo al cambio de estado.
         if new_state != last_state:
-            if new_state == STATE_DRIVING:
-                driver.setCruisingSpeed(TARGET_SPEED)
-                driver.setHazardFlashers(False)
-            elif new_state == STATE_BRAKE_PEDESTRIAN:
-                driver.setCruisingSpeed(BRAKE_SPEED_KMH)
-                driver.setHazardFlashers(False)
-            elif new_state == STATE_BRAKE_BARREL:
-                driver.setCruisingSpeed(BRAKE_SPEED_KMH)
-                driver.setHazardFlashers(True)
+            driver.setHazardFlashers(target_hazard)
             print(f"[STATE] -> {new_state} (dist={forward_m:.2f} m)")
             last_state = new_state
 
