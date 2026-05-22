@@ -4,3 +4,8 @@ __pycache__/
 *.png
 *.jpg
 .DS_Store
+
+# Activity 3.1 — large auxiliary files (regenerable)
+PennFudanPed/                          # training dataset (re-download via notebook)
+pedestrian_detection_executed.ipynb    # 21 MB executed copy with embedded outputs
+SDC_webots/_evidence/                  # captured log evidence (snapshots, large)
