@@ -9,3 +9,4 @@ __pycache__/
 PennFudanPed/                          # training dataset (re-download via notebook)
 pedestrian_detection_executed.ipynb    # 21 MB executed copy with embedded outputs
 SDC_webots/_evidence/                  # captured log evidence (snapshots, large)
+SDC_webots/captured_frames/            # frames + labels for Fix 2 retraining
