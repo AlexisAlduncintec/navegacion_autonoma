@@ -2,7 +2,11 @@
 ================================================================================
 Actividad 3.1 - Detección de peatones y barriles con frenado de emergencia
 MR4010 - Navegación Autónoma | Tecnológico de Monterrey | MNA
-Equipo 18 (entrega individual): Alexis Alduncin Barragán - A01017478
+Equipo 18:
+  - Alexis Alduncin Barragán          - A01017478
+  - David Rodrigo Alvarado Domínguez  - A01797606
+  - Abraham Avila Garcia              - A01795305
+  - Jorge Luis Ancheyta Segovia       - A01796354
 Profesor: Dr. David Antonio Torres
 ================================================================================
 
@@ -13,10 +17,13 @@ city_2025a_activity_3_1.wbt:
        -> ROI -> HoughLinesP -> PID -> Driver.setSteeringAngle()
     2. LiDAR Sick LMS 291 frontal: lectura del sector central (~25°) limitado
        a 20 m para detectar obstáculos por delante del vehículo.
-    3. Clasificador HOG + SVM (entrenado en Penn-Fudan, exportado por el
-       notebook pedestrian_detection (1).ipynb): se ejecuta SOLO cuando el LiDAR
-       confirma un obstáculo cercano. Sliding-window horizontal sobre la cámara
-       256x128 con ventana 64x128 tipo Dalal-Triggs.
+    3. Clasificador HOG + SVM (reentrenado con 600 frames de la cámara del
+       BMW hand-etiquetados + hard-negative mining estilo Dalal-Triggs; ver
+       retrain_svm_hardneg.py en este directorio. El modelo inicial entrenado
+       con Penn-Fudan fue descartado por brecha de dominio entre fotos reales
+       y mannequins renderizados de Webots): se ejecuta SOLO cuando el LiDAR
+       confirma un obstáculo cercano. Sliding-window horizontal sobre la
+       cámara 256x128 con ventana 64x128 tipo Dalal-Triggs.
     4. Máquina de estados de frenado: DRIVING / BRAKE_PEDESTRIAN / BRAKE_BARREL.
        Los barriles activan intermitentes; los peatones NO (se reanuda crucero
        cuando se quitan del frente).
