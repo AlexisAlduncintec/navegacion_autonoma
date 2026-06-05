@@ -43,7 +43,12 @@ ASPECT_MAX = 1.4               # aspect ratio máximo
 
 CNN_INPUT_SIZE = 32            # 32x32 RGB - arquitectura fijada en entrenamiento
 CNN_NORMALIZATION = 255.0      # /255 para mapear [0,255] -> [0,1] - igual que el training
-CONFIDENCE_THRESHOLD = 0.85    # umbral del softmax para aceptar una detección (suprime falsos positivos del fondo)
+CONFIDENCE_THRESHOLD = 0.65    # 0.85 -> 0.65: con la cámara de 128x64 las ROIs son
+                               # tan pequeñas que la CNN (entrenada en 32x32 GTSRB de
+                               # fotos reales) produce confianzas moderadas para señales
+                               # renderizadas en Webots. Las máscaras de cofre y cielo
+                               # ahora bloquean los falsos positivos dominantes, así que
+                               # podemos bajar el umbral sin volver a aceptar fondo.
 CNN_RUN_EVERY_N = 3            # throttle: corremos la inferencia 1 de cada N frames
 
 # Rangos HSV para los tres colores dominantes de las señales de tránsito.
