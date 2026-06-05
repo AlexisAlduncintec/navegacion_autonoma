@@ -41,7 +41,8 @@ ASPECT_MAX = 1.4               # aspect ratio máximo
 
 CNN_INPUT_SIZE = 32            # 32x32 RGB - arquitectura fijada en entrenamiento
 CNN_NORMALIZATION = 255.0      # /255 para mapear [0,255] -> [0,1] - igual que el training
-CONFIDENCE_THRESHOLD = 0.7     # mínimo de confianza del softmax para aceptar una detección
+CONFIDENCE_THRESHOLD = 0.85    # umbral del softmax para aceptar una detección (suprime falsos positivos del fondo)
+CNN_RUN_EVERY_N = 3            # throttle: corremos la inferencia 1 de cada N frames
 
 # Rangos HSV para los tres colores dominantes de las señales de tránsito.
 # El rojo envuelve el círculo HSV, por lo que se modela con dos rangos
@@ -135,6 +136,10 @@ def build_color_mask(bgr):
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
     combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    # Anular el 25% inferior: el cofre rojo del BMW cae en esa zona y dispararía
+    # la máscara de rojo generando candidatos falsos cada frame.
+    h, w = combined.shape
+    combined[int(h * 0.75):, :] = 0
     return combined
 
 
@@ -207,6 +212,9 @@ def main():
     # --- Estado de detección de señales (Actividad 4.1) ---
     unique_signs_seen = set()   # etiquetas distintas vistas durante la sesión
     frame_count = 0
+    # Detecciones aceptadas en la última corrida de la CNN. Se re-dibujan en los
+    # frames intermedios (cuando saltamos la inferencia por throttle).
+    last_detections = []
 
     # Instancia del vehículo y del driver (igual que 2.1).
     robot = Car()
@@ -236,20 +244,27 @@ def main():
         # Trabajamos en BGR para HSV y para los dibujos de OpenCV.
         bgr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
 
-        # --- Propuesta de candidatas por color + filtro de contornos ---
-        mask = build_color_mask(bgr)
-        candidates = propose_candidates(mask)
+        # --- Pipeline de percepción (throttled cada CNN_RUN_EVERY_N frames) ---
+        # En los frames intermedios reutilizamos las últimas detecciones para
+        # que el display no parpadee y para no saturar la inferencia de la CNN.
+        if frame_count % CNN_RUN_EVERY_N == 0:
+            mask = build_color_mask(bgr)
+            candidates = propose_candidates(mask)
+            refreshed = []
+            for (x, y, w, h) in candidates:
+                roi = bgr[y:y + h, x:x + w]
+                if roi.size == 0:
+                    continue
+                label, conf = classify_roi(model, label_map, roi)
+                if conf > CONFIDENCE_THRESHOLD:
+                    refreshed.append((x, y, w, h, label, conf))
+                    unique_signs_seen.add(label)
+            last_detections = refreshed
 
-        # --- Clasificación de cada ROI con la CNN ---
-        for (x, y, w, h) in candidates:
-            roi = bgr[y:y + h, x:x + w]
-            if roi.size == 0:
-                continue
-            label, conf = classify_roi(model, label_map, roi)
-            if conf > CONFIDENCE_THRESHOLD:
-                # Dibujamos sobre el BGRA original (el display recibe RGB después).
-                draw_detection(bgra, x, y, w, h, label, conf)
-                unique_signs_seen.add(label)
+        # Re-dibujar las últimas detecciones aceptadas sobre el frame actual
+        # (se ejecuta cada frame, no solo cuando corre la CNN).
+        for (x, y, w, h, label, conf) in last_detections:
+            draw_detection(bgra, x, y, w, h, label, conf)
 
         # --- Mostrar el frame anotado en el display del cockpit ---
         display_color_image(display_img, bgra)
