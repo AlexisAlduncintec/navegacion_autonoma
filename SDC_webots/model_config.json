@@ -1,0 +1,22 @@
+{
+  "input_shape": [
+    32,
+    32,
+    3
+  ],
+  "num_classes": 43,
+  "normalization": "divide_by_255",
+  "color_space": "RGB",
+  "test_accuracy": 0.9814726710319519,
+  "test_loss": 0.09325676411390305,
+  "classes_total": 43,
+  "training_samples": 31367,
+  "validation_samples": 7842,
+  "test_samples": 12630,
+  "architecture_summary": "Conv32-Conv64-MaxPool-Drop25-Conv128-MaxPool-Drop25-Flat-Dense256-Drop50-Dense43Softmax",
+  "optimizer": "Adam(lr=0.001)",
+  "loss_function": "categorical_crossentropy",
+  "batch_size": 128,
+  "epochs_trained": 30,
+  "augmentation_applied": true
+}
