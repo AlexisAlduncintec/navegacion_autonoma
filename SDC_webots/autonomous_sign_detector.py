@@ -217,6 +217,8 @@ def main():
     # Detecciones aceptadas en la última corrida de la CNN. Se re-dibujan en los
     # frames intermedios (cuando saltamos la inferencia por throttle).
     last_detections = []
+    # Bandera para el volcado de diagnóstico (se dispara una sola vez).
+    _snapshot_done = False
 
     # Instancia del vehículo y del driver (igual que 2.1).
     robot = Car()
@@ -277,6 +279,26 @@ def main():
                     f"cands={len(candidates)} acc={len(refreshed)} "
                     f"top=[{top_str}]"
                 )
+            # Volcado one-shot: en el primer frame de inferencia con candidatas
+            # guardamos vista completa, máscara HSV y cada ROI a disco para
+            # poder inspeccionar visualmente qué está clasificando la CNN.
+            if not _snapshot_done and len(candidates) > 0:
+                snap_dir = os.path.join(controller_dir, "debug_snapshot")
+                os.makedirs(snap_dir, exist_ok=True)
+                cv2.imwrite(os.path.join(snap_dir, "frame_full.png"), bgr)
+                cv2.imwrite(os.path.join(snap_dir, "mask.png"), mask)
+                for i, (cx, cy, cw, ch) in enumerate(candidates):
+                    roi_dump = bgr[cy:cy + ch, cx:cx + cw]
+                    if roi_dump.size == 0:
+                        continue
+                    lbl_i, conf_i = dbg_top[i] if i < len(dbg_top) else ("?", 0.0)
+                    # Nombre del archivo embebe pos+tamaño+etiqueta para correlacionar.
+                    safe = lbl_i.replace(" ", "_").replace("/", "_")
+                    fname = f"roi_{i:02d}_{cx}-{cy}_{cw}x{ch}_{safe}_{conf_i:.2f}.png"
+                    cv2.imwrite(os.path.join(snap_dir, fname), roi_dump)
+                print(f"[DBG] snapshot guardado en {snap_dir} "
+                      f"({len(candidates)} ROIs)")
+                _snapshot_done = True
 
         # Re-dibujar las últimas detecciones aceptadas sobre el frame actual
         # (se ejecuta cada frame, no solo cuando corre la CNN).
