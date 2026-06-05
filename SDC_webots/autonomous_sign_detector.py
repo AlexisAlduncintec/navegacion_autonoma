@@ -230,7 +230,9 @@ def main():
         frame_count += 1
 
         # --- Captura de imagen ---
-        bgra = get_image(camera)
+        # .copy(): get_image() devuelve una vista del buffer interno de Webots,
+        # que es de solo lectura; cv2.rectangle/putText necesitan un arreglo escribible.
+        bgra = get_image(camera).copy()
         # Trabajamos en BGR para HSV y para los dibujos de OpenCV.
         bgr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
 
