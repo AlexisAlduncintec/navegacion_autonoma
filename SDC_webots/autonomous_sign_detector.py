@@ -142,6 +142,10 @@ def build_color_mask(bgr):
     # la máscara de rojo generando candidatos falsos cada frame.
     h, w = combined.shape
     combined[int(h * 0.75):, :] = 0
+    # Anular el 15% superior: el cielo del mundo de Webots es un azul saturado
+    # que la CNN clasificaba como "Solo de frente" (~0.67). Las señales reales
+    # están a la altura de la cámara, no en el cielo.
+    combined[:int(h * 0.15), :] = 0
     return combined
 
 
