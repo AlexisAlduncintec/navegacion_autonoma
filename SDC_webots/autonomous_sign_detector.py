@@ -35,7 +35,9 @@ ANGLE_INCR = 0.05
 # =============================================================================
 # Constantes de detección de señales (Actividad 4.1)
 # =============================================================================
-MIN_CONTOUR_SIDE = 15          # lado mínimo en píxeles del bbox candidato
+MIN_CONTOUR_SIDE = 8           # 15 -> 8: la máscara HSV produce ~6-10% de píxeles pero
+                               # en blobs pequeños y dispersos; con 15 px se descartaban
+                               # incluso señales reales lejanas. 8 px captura ROIs distantes.
 ASPECT_MIN = 0.7               # aspect ratio mínimo (las señales son cuadradas)
 ASPECT_MAX = 1.4               # aspect ratio máximo
 
