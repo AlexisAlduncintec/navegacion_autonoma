@@ -251,15 +251,30 @@ def main():
             mask = build_color_mask(bgr)
             candidates = propose_candidates(mask)
             refreshed = []
+            # DBG: acumulamos (label, conf) de cada candidata para diagnóstico,
+            # incluso si no superan el umbral, así sabemos qué está viendo la CNN.
+            dbg_top = []
             for (x, y, w, h) in candidates:
                 roi = bgr[y:y + h, x:x + w]
                 if roi.size == 0:
                     continue
                 label, conf = classify_roi(model, label_map, roi)
+                dbg_top.append((label, conf))
                 if conf > CONFIDENCE_THRESHOLD:
                     refreshed.append((x, y, w, h, label, conf))
                     unique_signs_seen.add(label)
             last_detections = refreshed
+            # Instrumentación de diagnóstico (cada 30 frames de simulación):
+            # % de píxeles encendidos en la máscara HSV, nº de candidatas
+            # tras filtrar contornos, nº aceptadas y top-5 (clase, confianza).
+            if frame_count % 30 == 0:
+                mask_pct = float((mask > 0).sum()) / mask.size * 100.0
+                top_str = ", ".join(f"{lbl}@{c:.2f}" for lbl, c in dbg_top[:5])
+                print(
+                    f"[DBG] frame={frame_count} mask%={mask_pct:.1f} "
+                    f"cands={len(candidates)} acc={len(refreshed)} "
+                    f"top=[{top_str}]"
+                )
 
         # Re-dibujar las últimas detecciones aceptadas sobre el frame actual
         # (se ejecuta cada frame, no solo cuando corre la CNN).
