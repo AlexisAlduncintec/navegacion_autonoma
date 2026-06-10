@@ -602,6 +602,7 @@ BmwX5 {
   translation -1.2254 45.06 0.371816
   rotation 0.012795947566112598 -4.99889827643198e-07 0.9999181285113474 3.141589273847238
   controller "<extern>"
+  supervisor TRUE
   sensorsSlotFront [
     SickLms291 {
       translation 0.06 0 0

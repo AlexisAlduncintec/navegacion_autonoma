@@ -422,9 +422,24 @@ def wall_follow_right_steering(ds_front_m):
 
 def restore_heading_steering(saved_yaw_z, yaw_z):
     """Controlador P sobre el error de yaw para volver al rumbo previo a la
-    evasión. err = saved - actual. Si err > 0 hay que girar a la izquierda
-    (yaw aumenta antihorario en Webots), si err < 0 a la derecha."""
-    err = saved_yaw_z - yaw_z
+    evasión.
+
+    Convención de Webots-Driver: setSteeringAngle(positive) = giro a la
+    derecha = yaw DECRECE; setSteeringAngle(negative) = giro a la izquierda =
+    yaw CRECE.
+
+    Lógica corregida (bug del iter 4):
+      - Si yaw_z > saved (sobrepasamos giroizando), queremos disminuir yaw,
+        es decir, girar a la derecha -> steering POSITIVO.
+      - Por tanto cmd = HEADING_KP * (yaw - saved), NO (saved - yaw).
+
+    También: wrap del error a [-π, π] con atan2(sin, cos). Sin esto, si el
+    BMW da una vuelta completa durante evasión, el error se hace 2π en vez
+    de 0 y el controlador sigue girando indefinidamente. Bug observado en
+    iter 4: yaw crecía monotónicamente +1.66 -> +10.65.
+    """
+    raw_err = yaw_z - saved_yaw_z
+    err = math.atan2(math.sin(raw_err), math.cos(raw_err))
     cmd = HEADING_KP * err
     return max(-MAX_STEERING_ANGLE, min(MAX_STEERING_ANGLE, cmd))
 
@@ -460,7 +475,10 @@ def compute_transition(state, lidar_front_m, buses_seen, ds_front_m,
         return STATE_EVADE_WALL, new_streak
 
     if state == STATE_RESTORE_HEADING:
-        if abs(saved_yaw_z - yaw_z) < HEADING_TOLERANCE_RAD:
+        # Error wrapeado a [-π, π] (igual que en restore_heading_steering)
+        raw_err = yaw_z - saved_yaw_z
+        wrapped_err = math.atan2(math.sin(raw_err), math.cos(raw_err))
+        if abs(wrapped_err) < HEADING_TOLERANCE_RAD:
             return STATE_LANE, 0
         return STATE_RESTORE_HEADING, rear_free_streak
 
@@ -500,28 +518,55 @@ def identify_bus_by_color(recognition_color):
     return best_name
 
 
+def _safe_index_pair(maybe_ptr):
+    """Convierte un resultado de getPositionOnImage/getSizeOnImage (puede ser
+    lista Python o ctypes pointer) en una tupla (x, y). Defensivo porque la
+    API de Webots para CameraRecognitionObject devuelve ctypes pointers
+    para muchos atributos."""
+    try:
+        return (maybe_ptr[0], maybe_ptr[1])
+    except (TypeError, IndexError):
+        return (0, 0)
+
+
 def summarize_recognition_objects(rec_objs):
     """Convierte la lista de CameraRecognitionObject en una lista de dicts con
     los campos relevantes para esta actividad: bus_name, position (m, frame
     de cámara), size_on_image (px). Sólo conserva objetos que se identifican
-    como uno de los 4 autobuses."""
+    como uno de los 4 autobuses.
+
+    Importante: obj.getColors() devuelve un ctypes LP_c_double (pointer), no
+    una lista de Python. Tenemos que leer obj.getNumberOfColors() y luego
+    indexar el pointer (ncolors * 3 floats consecutivos, RGB intercalado).
+    Lo mismo pasa con getPosition() (pointer a 3 doubles) — getPosition() ya
+    es subscriptable, así que [0], [1], [2] funciona."""
     summary = []
     for obj in rec_objs:
-        colors = obj.getColors()  # lista plana [r1,g1,b1, r2,g2,b2, ...]
-        if not colors or len(colors) < 3:
+        try:
+            ncolors = obj.getNumberOfColors()
+        except Exception:
+            ncolors = 0
+        if ncolors < 1:
             continue
-        primary = (colors[0], colors[1], colors[2])
+        colors_ptr = obj.getColors()
+        try:
+            primary = (colors_ptr[0], colors_ptr[1], colors_ptr[2])
+        except (TypeError, IndexError):
+            continue
         bus_name = identify_bus_by_color(primary)
         if bus_name is None:
             continue
-        pos = obj.getPosition()  # [x, y, z] en metros, frame de cámara
-        size_img = obj.getPositionOnImage(), obj.getSizeOnImage()
+        pos_ptr = obj.getPosition()
+        try:
+            pos = (pos_ptr[0], pos_ptr[1], pos_ptr[2])
+        except (TypeError, IndexError):
+            pos = (float("nan"), float("nan"), float("nan"))
         summary.append({
             "bus": bus_name,
             "color_rgb": primary,
             "position_m": pos,
-            "pos_on_image": size_img[0],
-            "size_on_image": size_img[1],
+            "pos_on_image": _safe_index_pair(obj.getPositionOnImage()),
+            "size_on_image": _safe_index_pair(obj.getSizeOnImage()),
         })
     return summary
 
@@ -593,6 +638,33 @@ def main():
     robot = Car()
     driver = Driver()
     timestep = int(robot.getBasicTimeStep())
+
+    # Teleport del BMW al spawn validado de Actividad 2.1 ANTES de inicializar
+    # nada más. En la 4.2 el .wbt deja al BMW en (-1.22, 45.06) — justo al lado
+    # de una intersección donde la línea amarilla desaparece y el lane follower
+    # falla. El spawn original de 2.1 (-55.67, 45.88, 0.315) está en mitad de
+    # un tramo recto largo con línea amarilla continua y es donde la
+    # sintonización del PID está validada. supervisor TRUE en el BMW (.wbt)
+    # habilita esto.
+    # CRÍTICO: setear translation Y rotation A LA VEZ y llamar resetPhysics()
+    # para limpiar velocidad lineal/angular acumulada — sin resetPhysics el
+    # BMW arrastra la velocidad del momento de spawn y se estrella contra
+    # cualquier muro cercano.
+    SPAWN_X, SPAWN_Y, SPAWN_Z = -55.67054714756429, 45.88004292921422, 0.31513215760005664
+    SPAWN_AXIS = [0.012795947566112598, -4.99889827643198e-07, 0.9999181285113474]
+    SPAWN_ANGLE = 3.141589273847238
+    try:
+        self_node = robot.getSelf()
+        if self_node is not None:
+            self_node.getField("translation").setSFVec3f([SPAWN_X, SPAWN_Y, SPAWN_Z])
+            self_node.getField("rotation").setSFRotation(SPAWN_AXIS + [SPAWN_ANGLE])
+            self_node.resetPhysics()
+            print(f"[INIT] Teleport BMW -> ({SPAWN_X:.2f}, {SPAWN_Y:.2f}, {SPAWN_Z:.2f}) "
+                  f"yaw=π   (spawn validado de Actividad 2.1, physics reset)")
+        else:
+            print("[INIT] WARN: robot.getSelf() devolvió None - supervisor no habilitado?")
+    except Exception as e:
+        print(f"[INIT] WARN: no se pudo teleport BMW: {e}")
 
     # Cámara + Recognition habilitado por el .wbt (Recognition node)
     camera = robot.getDevice("camera")
@@ -668,6 +740,24 @@ def main():
         yaw_z += gyro.getValues()[2] * dt_s
         lidar_front_m = read_forward_distance(lidar, lidar_central)
         rec_objs = camera.getRecognitionObjects()
+        # DEBUG: imprime el conteo crudo (sin filtrar por color) cada 50 frames
+        # para diagnosticar si Recognition no encuentra nada vs filtro de color
+        # demasiado estricto.
+        if frame_count % 50 == 0:
+            print(f"[DEBUG REC] total_raw_objs={len(rec_objs)} "
+                  f"has_recog={camera.hasRecognition()}")
+        if frame_count % 50 == 0 and len(rec_objs) > 0:
+            for i, _o in enumerate(rec_objs[:5]):
+                try:
+                    nc = _o.getNumberOfColors()
+                    cptr = _o.getColors()
+                    c0 = (cptr[0], cptr[1], cptr[2]) if nc > 0 else None
+                    pos = _o.getPosition()
+                    print(f"[DEBUG REC] obj{i}: ncolors={nc} color0={c0} "
+                          f"pos=({pos[0]:+.2f},{pos[1]:+.2f},{pos[2]:+.2f}) "
+                          f"model={_o.getModel()}")
+                except Exception as e:
+                    print(f"[DEBUG REC] obj{i}: error reading attrs: {e}")
         buses_seen = summarize_recognition_objects(rec_objs)
         ds_front_m = right_ds["front"].getValue()
         ds_mid_m   = right_ds["mid"].getValue()
