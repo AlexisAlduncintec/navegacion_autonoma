@@ -46,6 +46,30 @@ Decisiones de diseño respecto a Actividad 2.1 (cada cambio justificado inline):
 
 Mundo: MR4010_Actividad_4_2/worlds/city_2025a.wbt (controller "<extern>")
 
+Tuning inicial (todas las constantes documentadas inline, listas para ajustar
+tras correr la sim - ver bloque "CONSTANTES DE LA MÁQUINA DE ESTADOS"):
+    LIDAR_BUS_TRIGGER_M     = 8.0   # disparo de evasión
+    RIGHT_SETPOINT_M        = 1.2   # holgura objetivo del flanco al bus
+    SIDE_KP                 = 0.6   # ganancia P de seguimiento de pared
+    RIGHT_FREE_M            = 4.5   # umbral de "rear libre"
+    RIGHT_FREE_HOLD_FRAMES  = 6     # debounce del rear (=192 ms a 32 ms ts)
+    HEADING_KP              = 1.5   # ganancia P de restauración de rumbo
+    HEADING_TOLERANCE_RAD   = 0.05  # ≈ 3°, tolerancia para llamarlo restaurado
+    EVADE_INIT_TURN_RAD     = 0.35  # swerve inicial a la izquierda
+    EVADE_SPEED_KMH         = 20.0  # velocidad durante EVADE_* y RESTORE
+
+Síntomas y ajustes esperados (afinación iterativa contra simulación):
+    - El coche raspa el lado derecho del autobús durante EVADE_WALL ->
+      subir RIGHT_SETPOINT_M (1.2 -> 1.5 o 1.8).
+    - El coche se aleja demasiado del autobús -> bajar SIDE_KP (0.6 -> 0.4) o
+      bajar RIGHT_SETPOINT_M.
+    - Oscila izquierda/derecha durante EVADE_WALL -> bajar SIDE_KP, considerar
+      añadir término D (no incluido en v1).
+    - Sale de EVADE_WALL antes de rebasar el autobús -> subir RIGHT_FREE_M
+      (4.5 -> 4.8) o RIGHT_FREE_HOLD_FRAMES (6 -> 10).
+    - Sobrepasa el rumbo objetivo en RESTORE -> bajar HEADING_KP (1.5 -> 1.0).
+    - Tarda mucho en restaurar -> subir HEADING_KP (1.5 -> 2.0).
+
 Uso (Mac / VS Code terminal):
     export WEBOTS_HOME=/Applications/Webots.app
     export PYTHONPATH=/Applications/Webots.app/Contents/lib/controller/python
@@ -536,6 +560,30 @@ def display_image_on_webots(display, image_bgr):
     display.imageDelete(image_ref)  # evita la fuga de slots de 3.1
 
 
+def draw_state_overlay(display, state, lidar_front_m, ds_front_m,
+                       ds_rear_m, yaw_z, saved_yaw_z, frames_in_state):
+    """Dibuja sobre el Display el estado actual y las métricas clave para
+    poder seguir la máquina de estados en vivo durante la sim.
+
+    Usa los primitivos de dibujo de Webots (drawText), no OpenCV, para no
+    sobrescribir la imagen de cámara ya pegada con imagePaste."""
+    # Color del texto según estado: ayuda a leerlo en el demo.
+    color_by_state = {
+        STATE_LANE:            0xFFFFFF,  # blanco
+        STATE_EVADE_START:     0xFFFF00,  # amarillo
+        STATE_EVADE_WALL:      0xFF8000,  # naranja
+        STATE_RESTORE_HEADING: 0x00FFFF,  # cian
+    }
+    display.setColor(color_by_state.get(state, 0xFF0000))
+    display.drawText(f"STATE: {state}", 4, 4)
+    display.setColor(0xFFFFFF)
+    lidar_str = f"{lidar_front_m:5.2f}" if math.isfinite(lidar_front_m) else "  inf"
+    display.drawText(f"LiDAR_F:{lidar_str}m  dsF:{ds_front_m:.2f}  dsR:{ds_rear_m:.2f}",
+                     4, 18)
+    display.drawText(f"yaw:{yaw_z:+.2f}  saved:{saved_yaw_z:+.2f}  f:{frames_in_state}",
+                     4, 32)
+
+
 # =============================================================================
 # LOOP PRINCIPAL
 # =============================================================================
@@ -707,9 +755,13 @@ def main():
         debug_image = draw_lines_on_image(image_bgr, lines)
         debug_image = draw_setpoint_line(debug_image)
         display_image_on_webots(display_img, debug_image)
+        # Overlay de estado + métricas clave ENCIMA de la imagen pegada.
+        draw_state_overlay(display_img, state, lidar_front_m, ds_front_m,
+                           ds_rear_m, yaw_z, saved_yaw_z, frames_in_state)
 
-        # 9. Log cada 50 frames (~0.5 s a 10 ms timestep)
+        # 9. Logging periódico
         frame_count += 1
+        # Log [F#] cada 50 frames (~1.6 s a 32 ms timestep) - estado general
         if frame_count % 50 == 0:
             err_str = f"{error:+.2f}" if error is not None else "  N/A"
             n_lines = len(lines) if lines is not None else 0
@@ -726,6 +778,26 @@ def main():
                 print(f"         bus={b['bus']:<22s} "
                       f"pos_cam=({pos[0]:+.2f},{pos[1]:+.2f},{pos[2]:+.2f}) m "
                       f"size_img={b['size_on_image']}")
+
+        # Log [METRICS] cada 5 frames cuando NO estamos en LANE: durante la
+        # evasión queremos resolución alta para diagnosticar la sintonización
+        # del controlador P de pared y de RESTORE_HEADING.
+        if state != STATE_LANE and frame_count % 5 == 0:
+            if state == STATE_EVADE_WALL:
+                err_wall = RIGHT_SETPOINT_M - ds_front_m
+                print(f"[METRICS] {state} f={frames_in_state} "
+                      f"dsF={ds_front_m:5.2f} dsR={ds_rear_m:5.2f} "
+                      f"err_wall={err_wall:+5.2f} steer={steering_angle:+.3f} "
+                      f"rear_streak={rear_free_streak}")
+            elif state == STATE_RESTORE_HEADING:
+                err_yaw = saved_yaw_z - yaw_z
+                print(f"[METRICS] {state} f={frames_in_state} "
+                      f"yaw={yaw_z:+.3f} target={saved_yaw_z:+.3f} "
+                      f"err_yaw={err_yaw:+.3f} steer={steering_angle:+.3f}")
+            else:  # EVADE_START
+                print(f"[METRICS] {state} f={frames_in_state} "
+                      f"dsF={ds_front_m:5.2f} lidar={lidar_front_m:.2f} "
+                      f"steer={steering_angle:+.3f}")
 
 
 if __name__ == "__main__":
