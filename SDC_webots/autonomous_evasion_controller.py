@@ -153,6 +153,46 @@ DS_RIGHT_REAR_NAME  = "ds_right_rear"
 DS_MAX_RANGE_M      = 5.0   # según el lookupTable; "no obstáculo" ≈ este valor
 
 # =============================================================================
+# CONSTANTES DE LA MÁQUINA DE ESTADOS DE EVASIÓN (Stage D)
+# =============================================================================
+
+# --- LANE -> EVADE_START ---
+# Disparamos evasión cuando (a) el LiDAR ve algo a menos de LIDAR_BUS_TRIGGER_M
+# en su sector central, Y (b) el Recognition ha identificado al menos uno de
+# los 4 autobuses por su color. La segunda condición protege contra falsos
+# positivos del LiDAR (semáforos, edificios cerca de intersecciones).
+LIDAR_BUS_TRIGGER_M     = 8.0   # m - distancia frontal para disparar evasión
+
+# --- EVADE_START: swerve inicial a la izquierda ---
+# Saca al BMW del carril para que el flanco derecho quede frente al autobús.
+# Si por alguna razón el front-right no detecta nada después de
+# EVADE_START_MAX_FRAMES (e.g. el autobús es más estrecho de lo esperado),
+# transitamos por timeout para no quedarnos atascados.
+EVADE_INIT_TURN_RAD     = 0.35  # rad - magnitud del swerve inicial (negativo en code)
+EVADE_START_MAX_FRAMES  = 25    # fallback timeout (~0.8 s a 32 ms timestep)
+
+# --- EVADE_WALL: seguimiento de pared derecha (P-only) ---
+RIGHT_SETPOINT_M        = 1.2   # m - distancia objetivo del flanco al autobús
+SIDE_KP                 = 0.6   # rad/m - ganancia P del seguimiento de pared
+
+# --- EVADE_WALL -> RESTORE_HEADING: salida debounceada ---
+# El sensor trasero (ds_right_rear) supera RIGHT_FREE_M cuando ya rebasamos el
+# autobús. Pedimos RIGHT_FREE_HOLD_FRAMES frames consecutivos para no salir
+# por un spike (e.g. parpadeo entre placas del Bus.proto).
+RIGHT_FREE_M            = 4.5   # m - umbral para llamar "rear libre"
+RIGHT_FREE_HOLD_FRAMES  = 6     # frames consecutivos requeridos
+
+# --- RESTORE_HEADING: restaurar el rumbo previo a la evasión ---
+HEADING_KP              = 1.5   # rad/rad - ganancia P sobre error de yaw
+HEADING_TOLERANCE_RAD   = 0.05  # rad - tolerancia para llamarlo restaurado (~3°)
+
+# --- EVADE_START: ventana inicial para detectar que ya estamos al lado del bus ---
+# El front-right baja de DS_MAX_RANGE_M (~5) a ~SETPOINT cuando el flanco del
+# autobús entra en el rayo. Usamos un umbral más generoso para no perder la
+# transición si el sensor parpadea durante el swerve.
+EVADE_WALL_ENTRY_M      = RIGHT_SETPOINT_M + 0.8  # ≈ 2.0 m
+
+# =============================================================================
 # MÁQUINA DE ESTADOS
 # =============================================================================
 # Stage A: sólo LANE existe; los otros se introducen en Stage D. Los nombres
@@ -341,6 +381,69 @@ def init_gyro(robot, timestep):
     return gyro
 
 
+def wall_follow_right_steering(ds_front_m):
+    """Controlador P para seguimiento de pared derecha. Mantiene el flanco
+    derecho del BMW a RIGHT_SETPOINT_M del autobús.
+
+    Convención de signos:
+      - err > 0  -> demasiado cerca -> girar a la IZQUIERDA (steering negativo)
+      - err < 0  -> demasiado lejos -> girar a la DERECHA (steering positivo)
+
+    Devuelve el comando de steering (rad), acotado al límite mecánico.
+    """
+    err = RIGHT_SETPOINT_M - ds_front_m
+    cmd = -SIDE_KP * err
+    return max(-MAX_STEERING_ANGLE, min(MAX_STEERING_ANGLE, cmd))
+
+
+def restore_heading_steering(saved_yaw_z, yaw_z):
+    """Controlador P sobre el error de yaw para volver al rumbo previo a la
+    evasión. err = saved - actual. Si err > 0 hay que girar a la izquierda
+    (yaw aumenta antihorario en Webots), si err < 0 a la derecha."""
+    err = saved_yaw_z - yaw_z
+    cmd = HEADING_KP * err
+    return max(-MAX_STEERING_ANGLE, min(MAX_STEERING_ANGLE, cmd))
+
+
+def compute_transition(state, lidar_front_m, buses_seen, ds_front_m,
+                       ds_rear_m, yaw_z, saved_yaw_z,
+                       frames_in_state, rear_free_streak):
+    """Devuelve (new_state, new_rear_free_streak). Función pura: las
+    transiciones dependen solo de los argumentos.
+
+    El streak del rear se mantiene a través de las transiciones porque sólo
+    importa dentro de EVADE_WALL (se reinicia al entrar).
+    """
+    if state == STATE_LANE:
+        if lidar_front_m < LIDAR_BUS_TRIGGER_M and len(buses_seen) > 0:
+            return STATE_EVADE_START, 0
+        return STATE_LANE, rear_free_streak
+
+    if state == STATE_EVADE_START:
+        # Salimos cuando el flanco derecho ve el bus, o por timeout.
+        if ds_front_m < EVADE_WALL_ENTRY_M or frames_in_state >= EVADE_START_MAX_FRAMES:
+            return STATE_EVADE_WALL, 0
+        return STATE_EVADE_START, rear_free_streak
+
+    if state == STATE_EVADE_WALL:
+        # Streak debounceado sobre ds_rear.
+        if ds_rear_m >= RIGHT_FREE_M:
+            new_streak = rear_free_streak + 1
+        else:
+            new_streak = 0
+        if new_streak >= RIGHT_FREE_HOLD_FRAMES:
+            return STATE_RESTORE_HEADING, 0
+        return STATE_EVADE_WALL, new_streak
+
+    if state == STATE_RESTORE_HEADING:
+        if abs(saved_yaw_z - yaw_z) < HEADING_TOLERANCE_RAD:
+            return STATE_LANE, 0
+        return STATE_RESTORE_HEADING, rear_free_streak
+
+    # Fallback - estado desconocido vuelve a LANE
+    return STATE_LANE, 0
+
+
 def init_right_distance_sensors(robot, timestep):
     """Inicializa los 3 DistanceSensor del flanco derecho. Devuelve un dict
     con claves 'front' / 'mid' / 'rear' apuntando al device correspondiente."""
@@ -489,6 +592,11 @@ def main():
     prev_angle = 0.0            # para el slew rate limit
     yaw_z = 0.0                 # yaw acumulado (rad) por integración del gyro
 
+    # Estado de la máquina de estados de evasión (Stage D)
+    saved_yaw_z = 0.0           # snapshot del yaw al entrar en EVADE_START
+    frames_in_state = 0         # cuántos frames lleva el estado actual
+    rear_free_streak = 0        # debounce del ds_right_rear (sólo en EVADE_WALL)
+
     # --- Loop principal ---
     # Usamos driver.step() (no robot.step()) para vaciar el buffer interno del
     # Driver en cada paso. Ver docstring del archivo.
@@ -517,19 +625,44 @@ def main():
         ds_mid_m   = right_ds["mid"].getValue()
         ds_rear_m  = right_ds["rear"].getValue()
 
-        # 4. Control de carril (estado LANE)
-        # En Stage A sólo existe LANE. La rama if/elif está armada para los
-        # estados de Stage D para minimizar diff entre commits.
+        # 4. Transición de estados (Stage D). Una sola fuente de verdad: la
+        # función pura compute_transition() decide en base a sensores.
+        new_state, rear_free_streak = compute_transition(
+            state, lidar_front_m, buses_seen, ds_front_m, ds_rear_m,
+            yaw_z, saved_yaw_z, frames_in_state, rear_free_streak,
+        )
+        if new_state != state:
+            # Hooks de entrada al nuevo estado
+            if new_state == STATE_EVADE_START:
+                # Snapshot del rumbo ANTES del swerve: lo usaremos en RESTORE.
+                saved_yaw_z = yaw_z
+                print(f"[STATE] {state} -> {new_state}  yaw_z snapshot={yaw_z:+.3f} rad "
+                      f"(lidar={lidar_front_m:.2f}m, buses={[b['bus'] for b in buses_seen]})")
+            elif new_state == STATE_LANE:
+                # Volvemos a carril: PID limpio para no arrastrar error viejo.
+                pid.reset()
+                last_valid_angle = 0.0
+                frames_since_detection = 0
+                print(f"[STATE] {state} -> {new_state}  yaw_z={yaw_z:+.3f} (target={saved_yaw_z:+.3f})")
+            else:
+                print(f"[STATE] {state} -> {new_state}  "
+                      f"(lidar={lidar_front_m:.2f}m, ds_F={ds_front_m:.2f} "
+                      f"ds_R={ds_rear_m:.2f}, yaw_z={yaw_z:+.3f})")
+            state = new_state
+            frames_in_state = 0
+        else:
+            frames_in_state += 1
+
+        # 5. Actuación por estado
         current_time = robot.getTime()
         if state == STATE_LANE:
+            # 2.1 PID lane-follower verbatim
             if error is None:
                 frames_since_detection += 1
                 no_line_count += 1
                 if frames_since_detection <= NO_DETECTION_GRACE_FRAMES:
-                    # Pérdida breve: mantener último ángulo válido
                     steering_angle = last_valid_angle
                 else:
-                    # Pérdida prolongada (intersección): conducir recto
                     steering_angle = DEFAULT_STEERING_ANGLE
                     pid.reset()
             else:
@@ -537,13 +670,28 @@ def main():
                 last_valid_angle = steering_angle
                 frames_since_detection = 0
             target_speed = TARGET_SPEED
+
+        elif state == STATE_EVADE_START:
+            # Swerve inicial a la izquierda (negativo en convención del Driver).
+            steering_angle = -EVADE_INIT_TURN_RAD
+            target_speed = EVADE_SPEED_KMH
+
+        elif state == STATE_EVADE_WALL:
+            # Seguimiento de pared derecha con P-only sobre ds_front_m.
+            steering_angle = wall_follow_right_steering(ds_front_m)
+            target_speed = EVADE_SPEED_KMH
+
+        elif state == STATE_RESTORE_HEADING:
+            # Volver al yaw_z guardado antes de empezar la evasión.
+            steering_angle = restore_heading_steering(saved_yaw_z, yaw_z)
+            target_speed = EVADE_SPEED_KMH
+
         else:
-            # Stage A: no debería llegar aquí; los estados EVADE_*/RESTORE
-            # se implementan en Stage D.
+            # Estado desconocido: comportamiento seguro = recto y lento.
             steering_angle = DEFAULT_STEERING_ANGLE
             target_speed = EVADE_SPEED_KMH
 
-        # 5. Slew rate limit (anti-jerk en steering)
+        # 6. Slew rate limit (anti-jerk en steering)
         delta = steering_angle - prev_angle
         if delta > MAX_ANGLE_CHANGE_PER_FRAME:
             steering_angle = prev_angle + MAX_ANGLE_CHANGE_PER_FRAME
@@ -551,16 +699,16 @@ def main():
             steering_angle = prev_angle - MAX_ANGLE_CHANGE_PER_FRAME
         prev_angle = steering_angle
 
-        # 6. Aplicar al vehículo
+        # 7. Aplicar al vehículo
         driver.setSteeringAngle(steering_angle)
         driver.setCruisingSpeed(target_speed)
 
-        # 7. Visualización en el display
+        # 8. Visualización en el display
         debug_image = draw_lines_on_image(image_bgr, lines)
         debug_image = draw_setpoint_line(debug_image)
         display_image_on_webots(display_img, debug_image)
 
-        # 8. Log cada 50 frames (~0.5 s a 10 ms timestep)
+        # 9. Log cada 50 frames (~0.5 s a 10 ms timestep)
         frame_count += 1
         if frame_count % 50 == 0:
             err_str = f"{error:+.2f}" if error is not None else "  N/A"
