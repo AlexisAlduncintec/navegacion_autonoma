@@ -653,6 +653,42 @@ BmwX5 {
     Gyro {
       name "gyro"
     }
+    DistanceSensor {
+      name "ds_right_front"
+      translation 1.8 -0.95 0
+      rotation 0 0 1 -1.5708
+      lookupTable [
+        0 0 0
+        5 5 0
+      ]
+      type "generic"
+      numberOfRays 1
+      aperture 0.05
+    }
+    DistanceSensor {
+      name "ds_right_mid"
+      translation 0 -0.95 0
+      rotation 0 0 1 -1.5708
+      lookupTable [
+        0 0 0
+        5 5 0
+      ]
+      type "generic"
+      numberOfRays 1
+      aperture 0.05
+    }
+    DistanceSensor {
+      name "ds_right_rear"
+      translation -1.8 -0.95 0
+      rotation 0 0 1 -1.5708
+      lookupTable [
+        0 0 0
+        5 5 0
+      ]
+      type "generic"
+      numberOfRays 1
+      aperture 0.05
+    }
   ]
 }
 GenericTrafficLight {

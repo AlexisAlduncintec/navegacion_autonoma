@@ -137,6 +137,21 @@ BUS_COLOR_MATCH_TOL = 0.10
 # angular en rad/s en el frame local del cuerpo. Para yaw integramos eje Z.
 GYRO_DEVICE_NAME = "gyro"
 
+# --- Sensores de distancia laterales (lado derecho del BMW) ---
+# Tres DistanceSensor genéricos de un rayo, montados en sensorsSlotCenter del
+# BMW con offsets (x, -0.95, 0) y rotación -π/2 alrededor de Z para apuntar el
+# rayo hacia la derecha del vehículo (-Y en el frame del cuerpo).
+#   - ds_right_front: x=+1.8 m (esquina delantera derecha)
+#   - ds_right_mid:   x= 0.0 m (centro del flanco derecho)
+#   - ds_right_rear:  x=-1.8 m (esquina trasera derecha)
+# LookupTable [0 0 0, 5 5 0] -> rango 0..5 m, salida = distancia en metros
+# (sin ruido para v1; se puede añadir ruido gaussiano más tarde si el reporte
+# lo pide). Apertura 0.05 rad ≈ 3°, rayo único.
+DS_RIGHT_FRONT_NAME = "ds_right_front"
+DS_RIGHT_MID_NAME   = "ds_right_mid"
+DS_RIGHT_REAR_NAME  = "ds_right_rear"
+DS_MAX_RANGE_M      = 5.0   # según el lookupTable; "no obstáculo" ≈ este valor
+
 # =============================================================================
 # MÁQUINA DE ESTADOS
 # =============================================================================
@@ -326,6 +341,21 @@ def init_gyro(robot, timestep):
     return gyro
 
 
+def init_right_distance_sensors(robot, timestep):
+    """Inicializa los 3 DistanceSensor del flanco derecho. Devuelve un dict
+    con claves 'front' / 'mid' / 'rear' apuntando al device correspondiente."""
+    ds = {
+        "front": robot.getDevice(DS_RIGHT_FRONT_NAME),
+        "mid":   robot.getDevice(DS_RIGHT_MID_NAME),
+        "rear":  robot.getDevice(DS_RIGHT_REAR_NAME),
+    }
+    for name, dev in ds.items():
+        dev.enable(timestep)
+    print(f"[INIT] DistanceSensors derechos habilitados: "
+          f"{DS_RIGHT_FRONT_NAME}, {DS_RIGHT_MID_NAME}, {DS_RIGHT_REAR_NAME}")
+    return ds
+
+
 def identify_bus_by_color(recognition_color):
     """Empareja un color RGB devuelto por Recognition con uno del catálogo
     BUS_COLORS_RGB. Devuelve el nombre del bus o None si no hay match.
@@ -437,6 +467,9 @@ def main():
     gyro = init_gyro(robot, timestep)
     dt_s = timestep / 1000.0  # paso de integración en segundos
 
+    # Sensores de distancia laterales (lado derecho del BMW)
+    right_ds = init_right_distance_sensors(robot, timestep)
+
     # Velocidad inicial
     driver.setCruisingSpeed(TARGET_SPEED)
 
@@ -472,7 +505,7 @@ def main():
         # 3. Cálculo del error
         error, num_valid = compute_error(lines, img_width)
 
-        # 3b. Lectura de sensores adicionales (Stage B).
+        # 3b. Lectura de sensores adicionales (Stage B + C).
         # Integramos yaw aquí cada frame; nunca se reinicia (se snapshotará al
         # entrar a EVADE_START en Stage D). Drift admisible para la ventana de
         # evasión (~pocos segundos).
@@ -480,6 +513,9 @@ def main():
         lidar_front_m = read_forward_distance(lidar, lidar_central)
         rec_objs = camera.getRecognitionObjects()
         buses_seen = summarize_recognition_objects(rec_objs)
+        ds_front_m = right_ds["front"].getValue()
+        ds_mid_m   = right_ds["mid"].getValue()
+        ds_rear_m  = right_ds["rear"].getValue()
 
         # 4. Control de carril (estado LANE)
         # En Stage A sólo existe LANE. La rama if/elif está armada para los
@@ -535,7 +571,8 @@ def main():
                   f"valid={num_valid} err={err_str} "
                   f"angle={steering_angle:+.4f} no_line_total={no_line_count} "
                   f"lidar={lidar_str} yaw_z={yaw_z:+.3f} rad "
-                  f"buses_seen={len(buses_seen)}")
+                  f"buses_seen={len(buses_seen)} "
+                  f"ds_R=(F:{ds_front_m:.2f} M:{ds_mid_m:.2f} R:{ds_rear_m:.2f}) m")
             for b in buses_seen:
                 pos = b["position_m"]
                 print(f"         bus={b['bus']:<22s} "
