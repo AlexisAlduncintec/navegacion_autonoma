@@ -55,7 +55,7 @@ Uso (Mac / VS Code terminal):
     python autonomous_evasion_controller.py
 """
 
-from controller import Display, Keyboard, Robot, Camera
+from controller import Display, Keyboard, Robot, Camera, Lidar, Gyro
 from vehicle import Car, Driver
 import math
 import numpy as np
@@ -100,6 +100,42 @@ MAX_ANGLE_CHANGE_PER_FRAME = 0.05
 # --- Comportamiento ante pérdida de línea --- (sin cambios)
 DEFAULT_STEERING_ANGLE = 0.0
 NO_DETECTION_GRACE_FRAMES = 20
+
+# =============================================================================
+# CONSTANTES DE SENSORES (Stage B)
+# =============================================================================
+
+# --- LiDAR Sick LMS 291 frontal ---
+# La PROTO instalada en sensorsSlotFront tiene el nombre por defecto del PROTO,
+# que es "Sick LMS 291" (con espacios y mayúsculas). En 3.1 lo confirmamos.
+LIDAR_DEVICE_NAME = "Sick LMS 291"
+# El Sick LMS 291 reporta 180 rayos sobre 180°. Sólo nos interesa el sector
+# central (~25°) para detectar obstáculos directamente frente al BMW.
+LIDAR_FOV_TOTAL_DEG    = 180.0
+LIDAR_FOV_CENTRAL_DEG  = 25.0
+# Limitamos el rango efectivo: el LiDAR ve hasta 80 m, pero más allá de 20 m
+# las detecciones son ruido o edificios del fondo.
+LIDAR_MAX_DETECT_M     = 20.0
+
+# --- Cámara con Recognition ---
+# El Recognition node está habilitado en el .wbt (max 10 objetos, occlusion=1,
+# rango 30 m). En el controlador sólo hay que llamar recognitionEnable().
+# Los 4 autobuses tienen recognitionColors = color visual (auto-derivado por el
+# template del Bus.proto), así que los podemos identificar por su color.
+BUS_COLORS_RGB = {
+    "vehicle(1)_blue":    (0.0313726, 0.121569, 0.419608),  # azul oscuro
+    "vehicle(2)_red":     (1.0,       0.0,       0.0),       # rojo
+    "vehicle(3)_magenta": (0.862745,  0.541176,  0.866667),  # magenta
+    "vehicle(4)_green":   (0.180392,  0.760784,  0.494118),  # verde
+}
+# Tolerancia para emparejar el color reportado por Recognition con el catálogo.
+# Distancia euclidiana en el cubo RGB (valores 0..1).
+BUS_COLOR_MATCH_TOL = 0.10
+
+# --- Gyro ---
+# El Gyro tiene name "gyro" (lo añadimos en el .wbt). Devuelve velocidad
+# angular en rad/s en el frame local del cuerpo. Para yaw integramos eje Z.
+GYRO_DEVICE_NAME = "gyro"
 
 # =============================================================================
 # MÁQUINA DE ESTADOS
@@ -252,6 +288,88 @@ def compute_error(lines, image_width):
 
 
 # =============================================================================
+# HELPERS DE SENSORES (Stage B)
+# =============================================================================
+
+def init_lidar(robot, timestep):
+    """Inicializa el LiDAR Sick LMS 291 y precalcula el slice del sector
+    central. Devuelve (lidar_device, central_slice_object). El slice es un
+    objeto slice nativo de Python para indexar getRangeImage() sin recalcular
+    índices cada frame."""
+    lidar = robot.getDevice(LIDAR_DEVICE_NAME)
+    lidar.enable(timestep)
+    lidar.enablePointCloud()
+    horiz_res = lidar.getHorizontalResolution()
+    central_n = max(1, int(horiz_res * LIDAR_FOV_CENTRAL_DEG / LIDAR_FOV_TOTAL_DEG))
+    mid = horiz_res // 2
+    half = central_n // 2
+    central_slice = slice(mid - half, mid + half)
+    print(f"[INIT] LiDAR: horiz_res={horiz_res}, sector central={central_n} "
+          f"rayos (slice [{mid-half}:{mid+half}])")
+    return lidar, central_slice
+
+
+def read_forward_distance(lidar, central_slice):
+    """Devuelve la distancia mínima finita en el sector central, acotada a
+    LIDAR_MAX_DETECT_M (más allá es ruido). Si no hay rayos finitos devuelve
+    inf (no hay obstáculo)."""
+    ranges = lidar.getRangeImage()[central_slice]
+    finite = [r for r in ranges if math.isfinite(r) and r <= LIDAR_MAX_DETECT_M]
+    return min(finite) if finite else float("inf")
+
+
+def init_gyro(robot, timestep):
+    """Inicializa el Gyro. Devuelve el device."""
+    gyro = robot.getDevice(GYRO_DEVICE_NAME)
+    gyro.enable(timestep)
+    print(f"[INIT] Gyro habilitado")
+    return gyro
+
+
+def identify_bus_by_color(recognition_color):
+    """Empareja un color RGB devuelto por Recognition con uno del catálogo
+    BUS_COLORS_RGB. Devuelve el nombre del bus o None si no hay match.
+
+    Webots redondea/aproxima los floats de recognitionColors al pasarlos por
+    el template, así que comparamos con tolerancia euclidiana."""
+    r, g, b = recognition_color
+    best_name = None
+    best_dist = BUS_COLOR_MATCH_TOL
+    for name, (cr, cg, cb) in BUS_COLORS_RGB.items():
+        d = math.sqrt((r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2)
+        if d < best_dist:
+            best_dist = d
+            best_name = name
+    return best_name
+
+
+def summarize_recognition_objects(rec_objs):
+    """Convierte la lista de CameraRecognitionObject en una lista de dicts con
+    los campos relevantes para esta actividad: bus_name, position (m, frame
+    de cámara), size_on_image (px). Sólo conserva objetos que se identifican
+    como uno de los 4 autobuses."""
+    summary = []
+    for obj in rec_objs:
+        colors = obj.getColors()  # lista plana [r1,g1,b1, r2,g2,b2, ...]
+        if not colors or len(colors) < 3:
+            continue
+        primary = (colors[0], colors[1], colors[2])
+        bus_name = identify_bus_by_color(primary)
+        if bus_name is None:
+            continue
+        pos = obj.getPosition()  # [x, y, z] en metros, frame de cámara
+        size_img = obj.getPositionOnImage(), obj.getSizeOnImage()
+        summary.append({
+            "bus": bus_name,
+            "color_rgb": primary,
+            "position_m": pos,
+            "pos_on_image": size_img[0],
+            "size_on_image": size_img[1],
+        })
+    return summary
+
+
+# =============================================================================
 # VISUALIZACIÓN (para depuración y video demo)
 # =============================================================================
 
@@ -295,12 +413,14 @@ def main():
     driver = Driver()
     timestep = int(robot.getBasicTimeStep())
 
-    # Cámara
+    # Cámara + Recognition habilitado por el .wbt (Recognition node)
     camera = robot.getDevice("camera")
     camera.enable(timestep)
+    camera.recognitionEnable(timestep)
     img_width = camera.getWidth()
     img_height = camera.getHeight()
-    print(f"[INIT] Cámara: {img_width}x{img_height}, setpoint={img_width/2}")
+    print(f"[INIT] Cámara: {img_width}x{img_height}, setpoint={img_width/2}, "
+          f"recognition habilitado")
 
     # Display para visualización en simulador
     display_img = Display("display_image")
@@ -309,6 +429,13 @@ def main():
     # debug, pero NO leemos teclas en el loop (controlador 100% autónomo).
     keyboard = Keyboard()
     keyboard.enable(timestep)
+
+    # LiDAR + sector central precalculado
+    lidar, lidar_central = init_lidar(robot, timestep)
+
+    # Gyro (para integrar el yaw_z)
+    gyro = init_gyro(robot, timestep)
+    dt_s = timestep / 1000.0  # paso de integración en segundos
 
     # Velocidad inicial
     driver.setCruisingSpeed(TARGET_SPEED)
@@ -327,6 +454,7 @@ def main():
     last_valid_angle = 0.0      # último ángulo aplicado con detección válida
     frames_since_detection = 0  # frames consecutivos sin línea detectada
     prev_angle = 0.0            # para el slew rate limit
+    yaw_z = 0.0                 # yaw acumulado (rad) por integración del gyro
 
     # --- Loop principal ---
     # Usamos driver.step() (no robot.step()) para vaciar el buffer interno del
@@ -343,6 +471,15 @@ def main():
 
         # 3. Cálculo del error
         error, num_valid = compute_error(lines, img_width)
+
+        # 3b. Lectura de sensores adicionales (Stage B).
+        # Integramos yaw aquí cada frame; nunca se reinicia (se snapshotará al
+        # entrar a EVADE_START en Stage D). Drift admisible para la ventana de
+        # evasión (~pocos segundos).
+        yaw_z += gyro.getValues()[2] * dt_s
+        lidar_front_m = read_forward_distance(lidar, lidar_central)
+        rec_objs = camera.getRecognitionObjects()
+        buses_seen = summarize_recognition_objects(rec_objs)
 
         # 4. Control de carril (estado LANE)
         # En Stage A sólo existe LANE. La rama if/elif está armada para los
@@ -392,9 +529,18 @@ def main():
         if frame_count % 50 == 0:
             err_str = f"{error:+.2f}" if error is not None else "  N/A"
             n_lines = len(lines) if lines is not None else 0
+            lidar_str = (f"{lidar_front_m:5.2f} m" if math.isfinite(lidar_front_m)
+                         else "   inf")
             print(f"[F{frame_count}] state={state} lines={n_lines} "
                   f"valid={num_valid} err={err_str} "
-                  f"angle={steering_angle:+.4f} no_line_total={no_line_count}")
+                  f"angle={steering_angle:+.4f} no_line_total={no_line_count} "
+                  f"lidar={lidar_str} yaw_z={yaw_z:+.3f} rad "
+                  f"buses_seen={len(buses_seen)}")
+            for b in buses_seen:
+                pos = b["position_m"]
+                print(f"         bus={b['bus']:<22s} "
+                      f"pos_cam=({pos[0]:+.2f},{pos[1]:+.2f},{pos[2]:+.2f}) m "
+                      f"size_img={b['size_on_image']}")
 
 
 if __name__ == "__main__":
