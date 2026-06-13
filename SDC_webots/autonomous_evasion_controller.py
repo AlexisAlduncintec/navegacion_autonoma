@@ -25,7 +25,8 @@ BMW X5 del mundo MR4010_Actividad_4_2/worlds/city_2025a.wbt:
 
 Máquina de estados (4 estados, string-based):
     LANE  -- LiDAR<TRIGGER + recognition -->  EVADE_START  (guarda yaw_z + bus id)
-    EVADE_START  -- bus en x>65% del frame (Recognition) o dsF ve flanco -->  EVADE_WALL
+    EVADE_START  -- |Δyaw| >= 0.6 rad (gyro) o dsF ve flanco -->  EVADE_WALL
+    EVADE_WALL (seek: arco suave hasta adquirir flanco; luego P de pared)
     EVADE_WALL  -- ds_right_rear libre N frames -->  RESTORE_HEADING
     RESTORE_HEADING  -- |yaw - saved| < TOL  -->  LANE
 
@@ -199,14 +200,31 @@ LIDAR_BUS_TRIGGER_M     = 8.0   # m - distancia frontal para disparar evasión
 EVADE_INIT_TURN_RAD     = 0.5   # rad - magnitud del swerve inicial (negativo en code)
 EVADE_START_MAX_FRAMES  = 60    # fallback timeout (~1.9 s a 32 ms timestep)
 
-# --- EVADE_START -> EVADE_WALL: gate por posición del bus en la imagen ---
-# iter 6: gate primario nuevo. Cuando la x del bus en el frame de cámara cruza
-# el 65% del ancho, el bus pasó de centro-frame a derecha-frame => el BMW ya
-# rotó lo suficiente a la izquierda para que los sensores laterales derechos
-# lo vean. Seguimos al MISMO bus entre frames vía el id del Recognition object
-# (capturado en LANE -> EVADE_START); si se ocluye o sale del frame, caen los
-# fallbacks (ds_right_front o timeout).
-EVADE_GATE_IMG_FRAC     = 0.65  # fracción del ancho de imagen
+# --- EVADE_START -> EVADE_WALL: gate por rotación real (yaw) ---
+# iter 6b: el gate por posición del bus en imagen (65% del ancho) resultó
+# inútil empíricamente: con cámara de 128 px y el bus a <8 m, el CENTRO del
+# bus cruza el umbral con apenas 3° de rotación (log iter 6a: yaw delta 0.058
+# rad al salir de EVADE_START) y el swerve nunca se ejecuta. Gate nuevo:
+# rotación REAL medida por el gyro. 0.6 rad ≈ 34° garantiza que el BMW quedó
+# en diagonal con el bus a su derecha. A 15 km/h con volante a 0.5 rad el
+# yaw rate es ~0.76 rad/s => ~25 frames, bien dentro del timeout de 60.
+EVADE_MIN_YAW_RAD       = 0.6   # rad - rotación mínima antes de pasar a WALL
+
+# --- EVADE_WALL: modo "seek" mientras el flanco no ha sido adquirido ---
+# iter 6b: el mecanismo del choque de iter 6a fue el comportamiento de "pared
+# perdida" del P de pared: con dsF=5.0 (sin flanco) el error -3.8 m comanda
+# volantazo a la derecha (+0.5) que re-apunta el morro al autobús. Mientras
+# ningún sensor derecho haya visto el flanco, usamos un arco suave a la
+# derecha (seek) en vez del P; al adquirir el flanco (wall_engaged) entra el
+# P normal.
+EVADE_SEEK_TURN_RAD     = 0.15  # rad - arco suave hacia el bus en modo seek
+
+# Salida de EVADE_WALL: el streak de "rear libre" sólo cuenta DESPUÉS de haber
+# adquirido el flanco al menos una vez (sin esto, la condición de salida es
+# trivialmente cierta y EVADE_WALL dura 6 frames sin seguir ninguna pared,
+# que fue el síntoma central de iters 1-6a). Safety absoluto por frames para
+# no quedarnos orbitando si nunca adquirimos el flanco.
+EVADE_WALL_MAX_FRAMES   = 400   # ~12.8 s a 32 ms - safety de EVADE_WALL
 
 # --- EVADE_WALL: seguimiento de pared derecha (P-only) ---
 RIGHT_SETPOINT_M        = 1.2   # m - distancia objetivo del flanco al autobús
@@ -459,14 +477,13 @@ def restore_heading_steering(saved_yaw_z, yaw_z):
 
 def compute_transition(state, lidar_front_m, buses_seen, ds_front_m,
                        ds_rear_m, yaw_z, saved_yaw_z,
-                       frames_in_state, rear_free_streak,
-                       evade_bus_img_x, img_width):
+                       frames_in_state, rear_free_streak, wall_engaged):
     """Devuelve (new_state, new_rear_free_streak). Función pura: las
     transiciones dependen solo de los argumentos.
 
-    evade_bus_img_x: coordenada x (px) del bus que estamos evadiendo en el
-    frame de cámara, o None si Recognition lo perdió este frame (ocluido o
-    fuera de frame) — en ese caso aplican los fallbacks de EVADE_START.
+    wall_engaged: True si algún sensor derecho ya vio el flanco del bus
+    durante el EVADE_WALL actual (lo mantiene el main loop, se resetea al
+    entrar a EVADE_WALL).
 
     El streak del rear se mantiene a través de las transiciones porque sólo
     importa dentro de EVADE_WALL (se reinicia al entrar).
@@ -477,23 +494,31 @@ def compute_transition(state, lidar_front_m, buses_seen, ds_front_m,
         return STATE_LANE, rear_free_streak
 
     if state == STATE_EVADE_START:
-        # Gate primario (iter 6): el bus cruzó al 65% derecho del frame =>
-        # el BMW ya rotó lo suficiente para que el flanco derecho lo adquiera.
-        # Fallbacks: el sensor derecho-frontal ya lo ve, o timeout.
-        img_gate = (evade_bus_img_x is not None
-                    and evade_bus_img_x > img_width * EVADE_GATE_IMG_FRAC)
-        if (img_gate or ds_front_m < EVADE_WALL_ENTRY_M
+        # Gate primario (iter 6b): rotación REAL >= EVADE_MIN_YAW_RAD medida
+        # por el gyro. Fallbacks: el sensor derecho-frontal ya ve el flanco,
+        # o timeout absoluto.
+        raw = yaw_z - saved_yaw_z
+        yaw_delta = abs(math.atan2(math.sin(raw), math.cos(raw)))
+        if (yaw_delta >= EVADE_MIN_YAW_RAD
+                or ds_front_m < EVADE_WALL_ENTRY_M
                 or frames_in_state >= EVADE_START_MAX_FRAMES):
             return STATE_EVADE_WALL, 0
         return STATE_EVADE_START, rear_free_streak
 
     if state == STATE_EVADE_WALL:
-        # Streak debounceado sobre ds_rear.
-        if ds_rear_m >= RIGHT_FREE_M:
+        # Streak debounceado sobre ds_rear — pero SÓLO después de haber
+        # adquirido el flanco (iter 6b): sin wall_engaged la condición de
+        # "rear libre" es trivialmente cierta y saldríamos sin haber seguido
+        # ninguna pared.
+        if wall_engaged and ds_rear_m >= RIGHT_FREE_M:
             new_streak = rear_free_streak + 1
         else:
             new_streak = 0
         if new_streak >= RIGHT_FREE_HOLD_FRAMES:
+            return STATE_RESTORE_HEADING, 0
+        if frames_in_state >= EVADE_WALL_MAX_FRAMES:
+            # Safety: nunca adquirimos el flanco. Restauramos rumbo antes de
+            # alejarnos más del carril.
             return STATE_RESTORE_HEADING, 0
         return STATE_EVADE_WALL, new_streak
 
@@ -747,6 +772,8 @@ def main():
     rear_free_streak = 0        # debounce del ds_right_rear (sólo en EVADE_WALL)
     evading_bus_id = None       # id Recognition del bus que estamos evadiendo
                                 # (capturado en LANE -> EVADE_START, iter 6)
+    wall_engaged = False        # True si el flanco ya fue visto en el
+                                # EVADE_WALL actual (iter 6b)
 
     # --- Loop principal ---
     # Usamos driver.step() (no robot.step()) para vaciar el buffer interno del
@@ -806,10 +833,19 @@ def main():
 
         # 4. Transición de estados (Stage D). Una sola fuente de verdad: la
         # función pura compute_transition() decide en base a sensores.
+        # Adquisición del flanco (iter 6b): cualquier sensor derecho por
+        # debajo de RIGHT_FREE_M significa que el bus está al lado.
+        if state == STATE_EVADE_WALL and not wall_engaged:
+            if min(ds_front_m, ds_mid_m, ds_rear_m) < RIGHT_FREE_M:
+                wall_engaged = True
+                print(f"[STATE] EVADE_WALL: flanco adquirido "
+                      f"(dsF={ds_front_m:.2f} dsM={ds_mid_m:.2f} "
+                      f"dsR={ds_rear_m:.2f})")
+
         new_state, rear_free_streak = compute_transition(
             state, lidar_front_m, buses_seen, ds_front_m, ds_rear_m,
             yaw_z, saved_yaw_z, frames_in_state, rear_free_streak,
-            evade_bus_img_x, img_width,
+            wall_engaged,
         )
         if new_state != state:
             # Hooks de entrada al nuevo estado
@@ -836,6 +872,8 @@ def main():
                 evading_bus_id = None  # evasión terminada: soltamos el bus
                 print(f"[STATE] {state} -> {new_state}  yaw_z={yaw_z:+.3f} (target={saved_yaw_z:+.3f})")
             else:
+                if new_state == STATE_EVADE_WALL:
+                    wall_engaged = False  # flanco aún no adquirido (iter 6b)
                 img_x_str = (f"{evade_bus_img_x:.0f}px"
                              if evade_bus_img_x is not None else "lost")
                 print(f"[STATE] {state} -> {new_state}  "
@@ -871,8 +909,14 @@ def main():
             target_speed = EVADE_SPEED_KMH
 
         elif state == STATE_EVADE_WALL:
-            # Seguimiento de pared derecha con P-only sobre ds_front_m.
-            steering_angle = wall_follow_right_steering(ds_front_m)
+            if wall_engaged:
+                # Seguimiento de pared derecha con P-only sobre ds_front_m.
+                steering_angle = wall_follow_right_steering(ds_front_m)
+            else:
+                # Modo seek (iter 6b): aún no vemos el flanco. Arco suave a
+                # la derecha en vez del P (que con dsF=5.0 comandaría +0.5 y
+                # re-apuntaría el morro al bus — el choque de iter 6a).
+                steering_angle = EVADE_SEEK_TURN_RAD
             target_speed = EVADE_SPEED_KMH
 
         elif state == STATE_RESTORE_HEADING:
@@ -931,8 +975,10 @@ def main():
         if state != STATE_LANE and frame_count % 5 == 0:
             if state == STATE_EVADE_WALL:
                 err_wall = RIGHT_SETPOINT_M - ds_front_m
-                print(f"[METRICS] {state} f={frames_in_state} "
-                      f"dsF={ds_front_m:5.2f} dsR={ds_rear_m:5.2f} "
+                mode = "follow" if wall_engaged else "seek"
+                print(f"[METRICS] {state} f={frames_in_state} mode={mode} "
+                      f"dsF={ds_front_m:5.2f} dsM={ds_mid_m:5.2f} "
+                      f"dsR={ds_rear_m:5.2f} "
                       f"err_wall={err_wall:+5.2f} steer={steering_angle:+.3f} "
                       f"rear_streak={rear_free_streak}")
             elif state == STATE_RESTORE_HEADING:
@@ -943,11 +989,13 @@ def main():
             else:  # EVADE_START
                 img_x_str = (f"{evade_bus_img_x:.0f}" if evade_bus_img_x is not None
                              else "lost")
+                raw = yaw_z - saved_yaw_z
+                yaw_delta = abs(math.atan2(math.sin(raw), math.cos(raw)))
                 print(f"[METRICS] {state} f={frames_in_state} "
                       f"dsF={ds_front_m:5.2f} lidar={lidar_front_m:.2f} "
                       f"steer={steering_angle:+.3f} "
-                      f"bus_img_x={img_x_str}/{img_width} "
-                      f"gate_at={img_width * EVADE_GATE_IMG_FRAC:.0f}")
+                      f"yaw_delta={yaw_delta:.3f}/{EVADE_MIN_YAW_RAD} "
+                      f"bus_img_x={img_x_str}/{img_width}")
 
 
 if __name__ == "__main__":
