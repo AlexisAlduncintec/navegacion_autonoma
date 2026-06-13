@@ -24,8 +24,8 @@ BMW X5 del mundo MR4010_Actividad_4_2/worlds/city_2025a.wbt:
        seguimiento de pared derecha y restauración del rumbo previo a la evasión.
 
 Máquina de estados (4 estados, string-based):
-    LANE  -- LiDAR<TRIGGER + recognition -->  EVADE_START  (guarda yaw_z)
-    EVADE_START  -- ds_right_front ve el flanco -->  EVADE_WALL
+    LANE  -- LiDAR<TRIGGER + recognition -->  EVADE_START  (guarda yaw_z + bus id)
+    EVADE_START  -- bus en x>65% del frame (Recognition) o dsF ve flanco -->  EVADE_WALL
     EVADE_WALL  -- ds_right_rear libre N frames -->  RESTORE_HEADING
     RESTORE_HEADING  -- |yaw - saved| < TOL  -->  LANE
 
@@ -55,8 +55,8 @@ tras correr la sim - ver bloque "CONSTANTES DE LA MÁQUINA DE ESTADOS"):
     RIGHT_FREE_HOLD_FRAMES  = 6     # debounce del rear (=192 ms a 32 ms ts)
     HEADING_KP              = 1.5   # ganancia P de restauración de rumbo
     HEADING_TOLERANCE_RAD   = 0.05  # ≈ 3°, tolerancia para llamarlo restaurado
-    EVADE_INIT_TURN_RAD     = 0.35  # swerve inicial a la izquierda
-    EVADE_SPEED_KMH         = 20.0  # velocidad durante EVADE_* y RESTORE
+    EVADE_INIT_TURN_RAD     = 0.5   # swerve inicial a la izquierda (iter 6)
+    EVADE_SPEED_KMH         = 15.0  # velocidad durante EVADE_* y RESTORE (iter 6)
 
 Síntomas y ajustes esperados (afinación iterativa contra simulación):
     - El coche raspa el lado derecho del autobús durante EVADE_WALL ->
@@ -94,7 +94,9 @@ import cv2
 # carril. Bajamos a EVADE_SPEED_KMH durante evasión y restauración: girar el
 # volante a 50 km/h pierde tracción en el modelo Ackermann del BMW X5.
 TARGET_SPEED = 50.0          # km/h - estado LANE
-EVADE_SPEED_KMH = 20.0       # km/h - estados EVADE_* y RESTORE_HEADING
+# iter 6: 20 -> 15. Más lento = más rotación de yaw por metro recorrido durante
+# el swerve inicial, para que el flanco derecho alcance a "mirar" al autobús.
+EVADE_SPEED_KMH = 15.0       # km/h - estados EVADE_* y RESTORE_HEADING
 MAX_STEERING_ANGLE = 0.5     # rad - límite mecánico del BMW X5
 
 # --- Parámetros de Canny --- (sin cambios respecto a Actividad 2.1)
@@ -189,11 +191,22 @@ LIDAR_BUS_TRIGGER_M     = 8.0   # m - distancia frontal para disparar evasión
 
 # --- EVADE_START: swerve inicial a la izquierda ---
 # Saca al BMW del carril para que el flanco derecho quede frente al autobús.
-# Si por alguna razón el front-right no detecta nada después de
-# EVADE_START_MAX_FRAMES (e.g. el autobús es más estrecho de lo esperado),
-# transitamos por timeout para no quedarnos atascados.
-EVADE_INIT_TURN_RAD     = 0.35  # rad - magnitud del swerve inicial (negativo en code)
-EVADE_START_MAX_FRAMES  = 25    # fallback timeout (~0.8 s a 32 ms timestep)
+# iter 6: 0.35 -> 0.5 y 25 -> 60 frames. En iters 1-5 el swerve era demasiado
+# tímido: EVADE_WALL entraba con dsF=5.0 (el sensor nunca adquiría el flanco)
+# y salía en ~6 frames por la condición de rear trivialmente libre. Con giro
+# al límite mecánico y más tiempo, el BMW rota lo suficiente para que el bus
+# quede a su derecha. El timeout queda como fallback, ya no como gate primario.
+EVADE_INIT_TURN_RAD     = 0.5   # rad - magnitud del swerve inicial (negativo en code)
+EVADE_START_MAX_FRAMES  = 60    # fallback timeout (~1.9 s a 32 ms timestep)
+
+# --- EVADE_START -> EVADE_WALL: gate por posición del bus en la imagen ---
+# iter 6: gate primario nuevo. Cuando la x del bus en el frame de cámara cruza
+# el 65% del ancho, el bus pasó de centro-frame a derecha-frame => el BMW ya
+# rotó lo suficiente a la izquierda para que los sensores laterales derechos
+# lo vean. Seguimos al MISMO bus entre frames vía el id del Recognition object
+# (capturado en LANE -> EVADE_START); si se ocluye o sale del frame, caen los
+# fallbacks (ds_right_front o timeout).
+EVADE_GATE_IMG_FRAC     = 0.65  # fracción del ancho de imagen
 
 # --- EVADE_WALL: seguimiento de pared derecha (P-only) ---
 RIGHT_SETPOINT_M        = 1.2   # m - distancia objetivo del flanco al autobús
@@ -446,9 +459,14 @@ def restore_heading_steering(saved_yaw_z, yaw_z):
 
 def compute_transition(state, lidar_front_m, buses_seen, ds_front_m,
                        ds_rear_m, yaw_z, saved_yaw_z,
-                       frames_in_state, rear_free_streak):
+                       frames_in_state, rear_free_streak,
+                       evade_bus_img_x, img_width):
     """Devuelve (new_state, new_rear_free_streak). Función pura: las
     transiciones dependen solo de los argumentos.
+
+    evade_bus_img_x: coordenada x (px) del bus que estamos evadiendo en el
+    frame de cámara, o None si Recognition lo perdió este frame (ocluido o
+    fuera de frame) — en ese caso aplican los fallbacks de EVADE_START.
 
     El streak del rear se mantiene a través de las transiciones porque sólo
     importa dentro de EVADE_WALL (se reinicia al entrar).
@@ -459,8 +477,13 @@ def compute_transition(state, lidar_front_m, buses_seen, ds_front_m,
         return STATE_LANE, rear_free_streak
 
     if state == STATE_EVADE_START:
-        # Salimos cuando el flanco derecho ve el bus, o por timeout.
-        if ds_front_m < EVADE_WALL_ENTRY_M or frames_in_state >= EVADE_START_MAX_FRAMES:
+        # Gate primario (iter 6): el bus cruzó al 65% derecho del frame =>
+        # el BMW ya rotó lo suficiente para que el flanco derecho lo adquiera.
+        # Fallbacks: el sensor derecho-frontal ya lo ve, o timeout.
+        img_gate = (evade_bus_img_x is not None
+                    and evade_bus_img_x > img_width * EVADE_GATE_IMG_FRAC)
+        if (img_gate or ds_front_m < EVADE_WALL_ENTRY_M
+                or frames_in_state >= EVADE_START_MAX_FRAMES):
             return STATE_EVADE_WALL, 0
         return STATE_EVADE_START, rear_free_streak
 
@@ -561,7 +584,13 @@ def summarize_recognition_objects(rec_objs):
             pos = (pos_ptr[0], pos_ptr[1], pos_ptr[2])
         except (TypeError, IndexError):
             pos = (float("nan"), float("nan"), float("nan"))
+        try:
+            obj_id = obj.getId()
+        except Exception:
+            obj_id = -1
         summary.append({
+            "id": obj_id,  # id del Recognition: estable entre frames, permite
+                           # seguir al MISMO bus durante toda la evasión
             "bus": bus_name,
             "color_rgb": primary,
             "position_m": pos,
@@ -716,6 +745,8 @@ def main():
     saved_yaw_z = 0.0           # snapshot del yaw al entrar en EVADE_START
     frames_in_state = 0         # cuántos frames lleva el estado actual
     rear_free_streak = 0        # debounce del ds_right_rear (sólo en EVADE_WALL)
+    evading_bus_id = None       # id Recognition del bus que estamos evadiendo
+                                # (capturado en LANE -> EVADE_START, iter 6)
 
     # --- Loop principal ---
     # Usamos driver.step() (no robot.step()) para vaciar el buffer interno del
@@ -763,29 +794,54 @@ def main():
         ds_mid_m   = right_ds["mid"].getValue()
         ds_rear_m  = right_ds["rear"].getValue()
 
+        # 3c. Posición en imagen del bus que estamos evadiendo (iter 6).
+        # Buscamos por id de Recognition para seguir al MISMO bus aunque la
+        # cámara vea otros. None si está ocluido / fuera de frame este frame.
+        evade_bus_img_x = None
+        if evading_bus_id is not None:
+            for b in buses_seen:
+                if b["id"] == evading_bus_id:
+                    evade_bus_img_x = b["pos_on_image"][0]
+                    break
+
         # 4. Transición de estados (Stage D). Una sola fuente de verdad: la
         # función pura compute_transition() decide en base a sensores.
         new_state, rear_free_streak = compute_transition(
             state, lidar_front_m, buses_seen, ds_front_m, ds_rear_m,
             yaw_z, saved_yaw_z, frames_in_state, rear_free_streak,
+            evade_bus_img_x, img_width,
         )
         if new_state != state:
             # Hooks de entrada al nuevo estado
             if new_state == STATE_EVADE_START:
                 # Snapshot del rumbo ANTES del swerve: lo usaremos en RESTORE.
                 saved_yaw_z = yaw_z
+                # Capturamos el id del bus más cercano (frame de cámara) para
+                # seguirlo durante EVADE_START aunque aparezcan otros buses.
+                def _bus_dist(b):
+                    x, y, z = b["position_m"]
+                    if all(math.isfinite(v) for v in (x, y, z)):
+                        return math.sqrt(x * x + y * y + z * z)
+                    return float("inf")
+                nearest = min(buses_seen, key=_bus_dist)
+                evading_bus_id = nearest["id"]
                 print(f"[STATE] {state} -> {new_state}  yaw_z snapshot={yaw_z:+.3f} rad "
-                      f"(lidar={lidar_front_m:.2f}m, buses={[b['bus'] for b in buses_seen]})")
+                      f"(lidar={lidar_front_m:.2f}m, buses={[b['bus'] for b in buses_seen]}, "
+                      f"evading={nearest['bus']} id={evading_bus_id})")
             elif new_state == STATE_LANE:
                 # Volvemos a carril: PID limpio para no arrastrar error viejo.
                 pid.reset()
                 last_valid_angle = 0.0
                 frames_since_detection = 0
+                evading_bus_id = None  # evasión terminada: soltamos el bus
                 print(f"[STATE] {state} -> {new_state}  yaw_z={yaw_z:+.3f} (target={saved_yaw_z:+.3f})")
             else:
+                img_x_str = (f"{evade_bus_img_x:.0f}px"
+                             if evade_bus_img_x is not None else "lost")
                 print(f"[STATE] {state} -> {new_state}  "
                       f"(lidar={lidar_front_m:.2f}m, ds_F={ds_front_m:.2f} "
-                      f"ds_R={ds_rear_m:.2f}, yaw_z={yaw_z:+.3f})")
+                      f"ds_R={ds_rear_m:.2f}, yaw_z={yaw_z:+.3f}, "
+                      f"bus_img_x={img_x_str}/{img_width}px)")
             state = new_state
             frames_in_state = 0
         else:
@@ -885,9 +941,13 @@ def main():
                       f"yaw={yaw_z:+.3f} target={saved_yaw_z:+.3f} "
                       f"err_yaw={err_yaw:+.3f} steer={steering_angle:+.3f}")
             else:  # EVADE_START
+                img_x_str = (f"{evade_bus_img_x:.0f}" if evade_bus_img_x is not None
+                             else "lost")
                 print(f"[METRICS] {state} f={frames_in_state} "
                       f"dsF={ds_front_m:5.2f} lidar={lidar_front_m:.2f} "
-                      f"steer={steering_angle:+.3f}")
+                      f"steer={steering_angle:+.3f} "
+                      f"bus_img_x={img_x_str}/{img_width} "
+                      f"gate_at={img_width * EVADE_GATE_IMG_FRAC:.0f}")
 
 
 if __name__ == "__main__":
