@@ -8,3 +8,8 @@ worlds/*.bak
 # Python
 __pycache__/
 *.pyc
+
+# Smoke-test and training artifacts — large model files, not for git
+notebooks/artifacts_*/
+notebooks/*.h5
+notebooks/*.weights.h5
