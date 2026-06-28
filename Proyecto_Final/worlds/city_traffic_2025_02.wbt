@@ -94,6 +94,7 @@ EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/project
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/balls/protos/SoccerBall.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/default/protos/SumoInterface.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/humans/pedestrian/protos/Pedestrian.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/devices/sick/protos/SickLms291.proto"
 
 WorldInfo {
   ERP 0.6
@@ -946,6 +947,30 @@ DEF WEBOTS_VEHICLE0 BmwX5 {
       fieldOfView 1
       width 320
       height 160
+      recognition Recognition {
+        maxRange 50
+        maxObjects 10
+        occlusion 0
+        frameColor 1 1 0
+        frameThickness 2
+      }
+    }
+  ]
+  sensorsSlotFront [
+    SickLms291 {
+      name "lidar"
+      translation 0 0 0
+    }
+    Radar {
+      name "radar"
+      translation 0 0 0
+      minRange 1.0
+      maxRange 80.0
+      horizontalFieldOfView 0.4
+      verticalFieldOfView 0.2
+      minAbsoluteRadialSpeed 0
+      minRadialSpeed 0
+      occlusion FALSE
     }
   ]
   sensorsSlotCenter [
