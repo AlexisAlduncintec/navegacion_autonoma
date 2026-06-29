@@ -195,7 +195,6 @@ BUS_COLORS_RGB = [
     (0.149020, 0.635294, 0.411765),   # verde
 ]
 BUS_COLOR_MATCH_TOL = 0.12   # distancia euclidiana en el cubo RGB [0,1]
-BUS_MIN_AREA_PX     = 1500   # px^2 mínimos en imagen para considerarlo "grande"
 BUS_CENTRAL_BAND    = 0.30   # fracción a cada lado del centro = "al frente"
 
 # --- Maniobra de evasión guiada por yaw (adaptación de la 4.2) ---
@@ -454,7 +453,7 @@ def _color_matches_bus(rgb):
 
 
 def scan_recognition(camera, img_width):
-    """Recorre los CameraRecognitionObject y devuelve (ped_ahead, bus_ahead).
+    """Recorre los CameraRecognitionObject y devuelve (ped_ahead, bus_ahead, ped_min_dist).
 
     ped_ahead: hay al menos un objeto cuyo modelo contiene 'pedestrian'.
     bus_ahead: hay al menos un autobús (modelo 'bus' / color de bus / tamaño
@@ -463,6 +462,7 @@ def scan_recognition(camera, img_width):
 
     getColors() devuelve un ctypes pointer; se lee con getNumberOfColors()."""
     ped_ahead = False
+    ped_min_dist = float("inf")
     bus_ahead = False
     central_lo = img_width * BUS_CENTRAL_BAND
     central_hi = img_width * (1.0 - BUS_CENTRAL_BAND)
@@ -473,27 +473,36 @@ def scan_recognition(camera, img_width):
             model = ""
         if "pedestrian" in model:
             ped_ahead = True
+            # Distancia tomada de la posición 3D del objeto de Recognition
+            # (más robusta que el LiDAR para un peatón delgado: los rayos del
+            # sector central del LiDAR pueden pasar a los lados sin tocarlo).
+            try:
+                p = obj.getPosition()
+                ped_min_dist = min(ped_min_dist,
+                                   math.sqrt(p[0] ** 2 + p[1] ** 2 + p[2] ** 2))
+            except Exception:
+                pass
             continue
-        # ¿Es un autobús? por modelo, por color, o por tamaño en imagen.
-        is_bus = "bus" in model
+        # ¿Es un autobús? El modelo es EXACTAMENTE "bus" (NO "bus stop", que
+        # también contiene la subcadena) o el color coincide con un
+        # recognitionColors de autobús. Se ELIMINÓ el fallback por tamaño en
+        # imagen: en World #2 (denso en edificios) cualquier edificio grande al
+        # frente excedía el umbral de píxeles y disparaba evasiones falsas
+        # (hallazgo del arnés de prueba autónomo, iter 1).
+        is_bus = (model.strip() == "bus")
         if not is_bus:
             try:
-                ncolors = obj.getNumberOfColors()
-                if ncolors >= 1:
+                if obj.getNumberOfColors() >= 1:
                     cptr = obj.getColors()
                     if _color_matches_bus((cptr[0], cptr[1], cptr[2])):
                         is_bus = True
             except Exception:
                 pass
-        size_on_image = _safe_pair(obj.getSizeOnImage())
-        if not is_bus:
-            if size_on_image[0] * size_on_image[1] >= BUS_MIN_AREA_PX:
-                is_bus = True
         if is_bus:
             cx = _safe_pair(obj.getPositionOnImage())[0]
             if central_lo <= cx <= central_hi:
                 bus_ahead = True
-    return ped_ahead, bus_ahead
+    return ped_ahead, bus_ahead, ped_min_dist
 
 
 # =============================================================================
@@ -597,14 +606,16 @@ def step_evasion(ev, yaw, lidar_front_m):
 # =============================================================================
 
 def decide_state(state, ev_active, manual_brake, ped_ahead, bus_ahead,
-                 lidar_front_m, radar_near_m):
+                 lidar_front_m, radar_near_m, ped_dist_m=float("inf")):
     """Decide el estado del tick. La evasión es 'sticky': una vez activa corre
     su sub-FSM hasta terminar (salvo que un peatón fuerce el freno: la seguridad
     del peatón gana siempre). El freno manual (SPACE) también gana sobre todo."""
     if manual_brake:
         return STATE_EMERGENCY_BRAKE
-    # Prioridad 1: peatón confirmado por LiDAR -> freno (gana incluso en evasión).
-    if ped_ahead and lidar_front_m < PED_BRAKE_DIST:
+    # Prioridad 1: peatón cercano -> freno (gana incluso en evasión).
+    # La distancia es la mínima entre la posición 3D del Recognition y el LiDAR
+    # (el LiDAR puede no tocar un peatón delgado; el Recognition sí lo ubica).
+    if ped_ahead and min(ped_dist_m, lidar_front_m) < PED_BRAKE_DIST:
         return STATE_EMERGENCY_BRAKE
     # Si hay una evasión en curso, mantenerla hasta que su sub-FSM diga 'done'.
     if ev_active:
@@ -737,7 +748,7 @@ def main():
         yaw_z += gyro.getValues()[2] * dt_s
         lidar_front_m = read_forward_distance(lidar, lidar_central)
         radar_near_m = read_radar_nearest(radar)
-        ped_ahead, bus_ahead = scan_recognition(camera, img_width)
+        ped_ahead, bus_ahead, ped_dist_m = scan_recognition(camera, img_width)
 
         # 4. Predicción CIL (siempre se calcula; se aplica sólo en CIL_CRUISE).
         # Índice de comando = command - 2 (0..3) para la rama del CommandSwitch.
@@ -748,7 +759,8 @@ def main():
 
         # 5. Decisión de estado (prioridad documentada).
         new_state = decide_state(state, ev is not None, manual_brake,
-                                 ped_ahead, bus_ahead, lidar_front_m, radar_near_m)
+                                 ped_ahead, bus_ahead, lidar_front_m, radar_near_m,
+                                 ped_dist_m)
 
         # Hooks de entrada/salida de la evasión.
         if new_state == STATE_EVASION and ev is None:
