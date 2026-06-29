@@ -138,6 +138,16 @@ EVADE_SPEED_KMH    = 15.0     # velocidad durante la maniobra de evasión
 MAX_STEERING_ANGLE = 0.5      # rad - límite mecánico del BMW X5
 MAX_ANGLE_CHANGE_PER_FRAME = 0.05  # slew-rate del volante (anti-jerk)
 
+# --- Modo híbrido PID + CIL (seguimiento de carril robusto en World #2) ---
+# El modelo CIL predice steering casi cero en World #2 (brecha de dominio
+# World#1->World#2) y el coche se sale en curvas. En el estado CIL_CRUISE
+# mezclamos la predicción del modelo con un PID basado en la línea central
+# amarilla detectada en la cámara (patrón de la Actividad 2.1).
+HYBRID_MODE   = True
+LANE_PID_KP   = 0.4    # ganancia P sobre el error normalizado de la línea
+HYBRID_W_CIL  = 0.3    # peso de la predicción del modelo CIL
+HYBRID_W_PID  = 0.7    # peso del PID de la línea amarilla
+
 # --- Entrada del modelo CIL (Codevilla) ---
 IMG_W = 200
 IMG_H = 88
@@ -378,6 +388,25 @@ def preprocess_for_cil(bgr):
     return np.expand_dims(norm, axis=0)
 
 
+def compute_pid_steer(bgr, img_width):
+    """Steering PID basado en la línea central amarilla (patrón fotométrico de
+    la Actividad 2.1). Umbral HSV amarillo -> centro de masa de los píxeles
+    amarillos en la mitad inferior de la imagen -> error normalizado -> -KP*error.
+    Devuelve (steer, lane_seen). lane_seen=False si no se ve la línea (el híbrido
+    cae de vuelta al modelo CIL en ese caso)."""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array([15, 80, 80]), np.array([40, 255, 255]))
+    h = mask.shape[0]
+    lower = mask[h // 2:, :]                      # sólo la mitad inferior
+    m = cv2.moments(lower)
+    if m["m00"] < 1e-3:
+        return 0.0, False                          # no hay línea amarilla visible
+    cm_x = m["m10"] / m["m00"]
+    error = (img_width / 2.0 - cm_x) / (img_width / 2.0)
+    steer = -LANE_PID_KP * error
+    return max(-MAX_STEERING_ANGLE, min(MAX_STEERING_ANGLE, steer)), True
+
+
 # =============================================================================
 # SENSORES
 # =============================================================================
@@ -529,7 +558,7 @@ def paste_camera_to_display(display, bgr, dw, dh):
 
 
 def draw_hud(display, dw, dh, command, state, model_steer, speed_kmh,
-             steer_applied, radar_m, lidar_m):
+             steer_applied, radar_m, lidar_m, pid_steer=0.0):
     """Overlay sobre la imagen ya pegada (drawText de Webots, no OpenCV).
     Layout pensado para el Display 200x150 del BMW."""
     # Arriba-izquierda: comando activo (color-coded).
@@ -538,9 +567,11 @@ def draw_hud(display, dw, dh, command, state, model_steer, speed_kmh,
     # Arriba-derecha: estado (color-coded).
     display.setColor(STATE_COLOR.get(state, 0xFFFFFF))
     display.drawText(f"STATE: {state}", max(4, dw - 116), 4)
-    # Centro: predicción cruda del modelo.
+    # Centro: predicción cruda del modelo + mezcla híbrida.
     display.setColor(0xFFFFFF)
     display.drawText(f"MODEL_STEER: {model_steer:+.3f}", 4, dh // 2 - 8)
+    if HYBRID_MODE:
+        display.drawText(f"PID:{pid_steer:+.3f}  CIL:{model_steer:+.3f}", 4, dh // 2 + 6)
     # Abajo-izquierda: velocidad + steering aplicado.
     display.drawText(f"spd:{speed_kmh:4.1f}  steer_applied:{steer_applied:+.3f}",
                      4, dh - 28)
@@ -757,6 +788,12 @@ def main():
         pred = model({"image": img_in, "command": cmd_idx}, training=False)
         model_steer = float(np.reshape(np.asarray(pred), -1)[0])
 
+        # 4b. PID de línea amarilla (modo híbrido). Se calcula cada tick para el HUD.
+        if HYBRID_MODE:
+            pid_steer, lane_seen = compute_pid_steer(bgr, img_width)
+        else:
+            pid_steer, lane_seen = 0.0, False
+
         # 5. Decisión de estado (prioridad documentada).
         new_state = decide_state(state, ev is not None, manual_brake,
                                  ped_ahead, bus_ahead, lidar_front_m, radar_near_m,
@@ -781,7 +818,13 @@ def main():
 
         # 6. Actuación por estado.
         if state == STATE_CIL_CRUISE:
-            steering = max(-MAX_STEERING_ANGLE, min(MAX_STEERING_ANGLE, model_steer))
+            # Híbrido: 30% CIL + 70% PID de línea amarilla (si se ve la línea).
+            # Sin línea visible, se usa sólo la predicción del modelo.
+            if HYBRID_MODE and lane_seen:
+                steering = max(-MAX_STEERING_ANGLE, min(MAX_STEERING_ANGLE,
+                               HYBRID_W_CIL * model_steer + HYBRID_W_PID * pid_steer))
+            else:
+                steering = max(-MAX_STEERING_ANGLE, min(MAX_STEERING_ANGLE, model_steer))
             target_speed = TARGET_SPEED_KMH
 
         elif state == STATE_EMERGENCY_BRAKE:
@@ -824,7 +867,7 @@ def main():
         # 9. HUD.
         paste_camera_to_display(display, bgr, dw, dh)
         draw_hud(display, dw, dh, st["command"], state, model_steer,
-                 target_speed, steering, radar_near_m, lidar_front_m)
+                 target_speed, steering, radar_near_m, lidar_front_m, pid_steer)
 
         # 10. Log periódico (cada 50 frames).
         if frame_count % 50 == 0:
