@@ -13,3 +13,6 @@ __pycache__/
 notebooks/artifacts_*/
 notebooks/*.h5
 notebooks/*.weights.h5
+
+# Demo videos — large, hosted on YouTube for submission, not in git
+video_evidence/*.mp4
